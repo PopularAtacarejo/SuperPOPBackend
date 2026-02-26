@@ -1,1 +1,65 @@
-[]
+{
+  "template": {
+    "base_size": {
+      "width": 1059,
+      "height": 662
+    }
+  },
+  "text": {
+    "collaborator_baseline": [
+      278,
+      306
+    ],
+    "recognized_baseline": [
+      265,
+      345
+    ],
+    "date_baseline": [
+      672,
+      345
+    ],
+    "collaborator_max_x": 474,
+    "recognized_max_x": 530,
+    "date_max_x": 938
+  },
+  "checkbox": {
+    "centers": {
+      "acolhimento": [
+        154,
+        686
+      ],
+      "eficiencia": [
+        390,
+        686
+      ],
+      "cortesia": [
+        596,
+        686
+      ],
+      "resultado": [
+        800,
+        686
+      ]
+    },
+    "center_y_offset": 240,
+    "box_size": [
+      29,
+      29
+    ],
+    "line_width_scale": 4.0
+  },
+  "message": {
+    "origin": [
+      110,
+      509
+    ],
+    "max_width": 840,
+    "max_lines": 3,
+    "line_gap_base": 11
+  },
+  "qr": {
+    "base_size": 66,
+    "x": 36,
+    "bottom_margin": 46
+  }
+}
