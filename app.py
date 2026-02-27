@@ -14,11 +14,11 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from flask import Flask, jsonify, request, send_from_directory, url_for
+from flask import Flask, jsonify, redirect, request, send_from_directory, session, url_for
 from flask_cors import CORS
 from PIL import Image, ImageDraw, ImageFont
 
@@ -30,6 +30,8 @@ TEMPLATE_CACHE_DIR = BASE_DIR / "generated" / "templates"
 TEMPLATE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 DATA_FILE = BASE_DIR / "Dados.json"
 DATA_FILE_LOCK = threading.Lock()
+EMPLOYEES_FILE = BASE_DIR / "Funcioinarios.json"
+EMPLOYEES_FILE_LOCK = threading.Lock()
 PENDING_SEND_KEYS: set[str] = set()
 DEFAULT_TEMPLATE_PATHS = [
     BASE_DIR / "assets" / "Super-POP.png",
@@ -111,6 +113,9 @@ load_dotenv_file(DOTENV_PATH)
 
 if not DATA_FILE.exists():
     DATA_FILE.write_text("[]\n", encoding="utf-8")
+
+if not EMPLOYEES_FILE.exists():
+    EMPLOYEES_FILE.write_text("[]\n", encoding="utf-8")
 
 if not LAYOUT_FILE.exists():
     LAYOUT_FILE.write_text(
@@ -1241,6 +1246,326 @@ def append_send_log(record: dict) -> dict:
     return github_sync
 
 
+EMPLOYEE_PHONE_PATTERN = re.compile(r"^\(\d{2}\)\s9\s\d{4}\s-\s\d{4}$")
+EMPLOYEE_EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+
+
+def normalize_employee_phone_digits(value: str) -> str:
+    return re.sub(r"\D", "", str(value or ""))
+
+
+def normalize_spaces(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip())
+
+
+def normalize_employee_payload(payload: dict) -> dict:
+    if not isinstance(payload, dict):
+        payload = {}
+    return {
+        "nome": normalize_spaces(payload.get("nome", "")),
+        "funcao": normalize_spaces(payload.get("funcao", "")),
+        "numero_celular": normalize_spaces(payload.get("numero_celular", "")),
+        "email": str(payload.get("email", "") or "").strip().lower(),
+        "senha": str(payload.get("senha", "") or ""),
+    }
+
+
+def validate_employee_payload(payload: dict) -> tuple[bool, str]:
+    nome = payload.get("nome", "")
+    funcao = payload.get("funcao", "")
+    numero_celular = payload.get("numero_celular", "")
+    email = payload.get("email", "")
+    senha = payload.get("senha", "")
+
+    if len(nome) < 3:
+        return False, "Informe um nome valido com pelo menos 3 caracteres."
+    if len(funcao) < 2:
+        return False, "Informe uma funcao valida."
+    if not EMPLOYEE_PHONE_PATTERN.fullmatch(numero_celular):
+        return False, "Numero de celular invalido. Use o formato (xx) 9 0000 - 0000."
+
+    phone_digits = normalize_employee_phone_digits(numero_celular)
+    if len(phone_digits) != 11 or phone_digits[2] != "9":
+        return False, "Numero de celular invalido."
+
+    if email and not EMPLOYEE_EMAIL_PATTERN.fullmatch(email):
+        return False, "Email invalido."
+    if len(senha) < 6:
+        return False, "A senha deve ter pelo menos 6 caracteres."
+
+    return True, ""
+
+
+def read_employees() -> list:
+    if not EMPLOYEES_FILE.exists():
+        return []
+    try:
+        data = json.loads(EMPLOYEES_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else []
+    except json.JSONDecodeError:
+        return []
+
+
+def write_employees(records: list) -> None:
+    temp_file = EMPLOYEES_FILE.with_suffix(".tmp")
+    temp_file.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_file.replace(EMPLOYEES_FILE)
+
+
+def employee_record_key(record: dict) -> str:
+    if not isinstance(record, dict):
+        return ""
+
+    record_id = str(record.get("id", "")).strip()
+    if record_id:
+        return f"id:{record_id}"
+
+    phone_value = normalize_employee_phone_digits(record.get("numero_normalizado") or record.get("numero_celular") or "")
+    if phone_value:
+        return f"phone:{phone_value}"
+
+    email_value = str(record.get("email", "") or "").strip().lower()
+    if email_value:
+        return f"email:{email_value}"
+
+    try:
+        return "raw:" + json.dumps(record, ensure_ascii=False, sort_keys=True)
+    except Exception:  # noqa: BLE001
+        return "raw:" + str(record)
+
+
+def merge_employee_lists(*sources: list) -> list:
+    merged: list = []
+    seen: set[str] = set()
+
+    for source in sources:
+        if not isinstance(source, list):
+            continue
+        for item in source:
+            if not isinstance(item, dict):
+                continue
+            key = employee_record_key(item)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            merged.append(item)
+
+    return merged
+
+
+def github_sync_employees(records: list) -> dict:
+    token = get_env("GITHUB_TOKEN")
+    if not token:
+        return {"synced": False, "reason": "GITHUB_TOKEN nao configurado"}
+
+    repo = get_env("GITHUB_REPO", "PopularAtacarejo/SuperPOP")
+    file_path = get_env("GITHUB_EMPLOYEES_FILE_PATH", "Funcioinarios.json")
+    branch = get_env("GITHUB_BRANCH", "main")
+    api_base = f"https://api.github.com/repos/{repo}/contents/{file_path}"
+    get_url = f"{api_base}?ref={urllib.parse.quote(branch)}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "superpop-backend",
+    }
+
+    sha = None
+    remote_records: list = []
+    try:
+        req_get = urllib.request.Request(get_url, headers=headers, method="GET")
+        with urllib.request.urlopen(req_get, timeout=20) as resp:
+            current = json.loads(resp.read().decode("utf-8"))
+            sha = current.get("sha")
+            encoded_content = str(current.get("content") or "").strip()
+            if encoded_content:
+                try:
+                    decoded_content = base64.b64decode(encoded_content).decode("utf-8")
+                    loaded_remote = json.loads(decoded_content)
+                    if isinstance(loaded_remote, list):
+                        remote_records = loaded_remote
+                except Exception:  # noqa: BLE001
+                    remote_records = []
+            if not remote_records:
+                download_url = str(current.get("download_url") or "").strip()
+                if download_url:
+                    try:
+                        req_download = urllib.request.Request(download_url, headers=headers, method="GET")
+                        with urllib.request.urlopen(req_download, timeout=20) as download_resp:
+                            download_payload = json.loads(download_resp.read().decode("utf-8"))
+                            if isinstance(download_payload, list):
+                                remote_records = download_payload
+                    except Exception:  # noqa: BLE001
+                        remote_records = []
+    except urllib.error.HTTPError as exc:
+        if exc.code != 404:
+            return {"synced": False, "reason": f"GitHub GET falhou ({exc.code})"}
+    except Exception as exc:  # noqa: BLE001
+        return {"synced": False, "reason": f"GitHub GET erro: {exc}"}
+
+    merged_records = merge_employee_lists(remote_records, records)
+    content = base64.b64encode(json.dumps(merged_records, ensure_ascii=False, indent=2).encode("utf-8")).decode("utf-8")
+    utc_now = datetime.now(ZoneInfo("UTC")).isoformat().replace("+00:00", "Z")
+    payload = {
+        "message": f"Atualiza Funcioinarios.json ({utc_now})",
+        "content": content,
+        "branch": branch,
+    }
+    if sha:
+        payload["sha"] = sha
+
+    try:
+        req_put = urllib.request.Request(
+            api_base,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={**headers, "Content-Type": "application/json"},
+            method="PUT",
+        )
+        with urllib.request.urlopen(req_put, timeout=30):
+            return {
+                "synced": True,
+                "reason": "ok",
+                "merged_records": merged_records,
+                "remote_count": len(remote_records),
+                "sent_count": len(records),
+                "merged_count": len(merged_records),
+            }
+    except urllib.error.HTTPError as exc:
+        return {"synced": False, "reason": f"GitHub PUT falhou ({exc.code})"}
+    except Exception as exc:  # noqa: BLE001
+        return {"synced": False, "reason": f"GitHub PUT erro: {exc}"}
+
+
+def github_sync_employees_with_retry(records: list) -> dict:
+    retries = max(1, int(to_number(get_env("GITHUB_SYNC_RETRIES", "3"), 3)))
+    retry_delay = max(0.0, to_number(get_env("GITHUB_SYNC_RETRY_DELAY_SECONDS", "1.0"), 1.0))
+    last_result = {"synced": False, "reason": "Sync nao executado."}
+
+    for attempt in range(1, retries + 1):
+        result = github_sync_employees(records)
+        result["attempt"] = attempt
+        result["max_attempts"] = retries
+        if result.get("synced"):
+            return result
+        last_result = result
+        if attempt < retries and retry_delay > 0:
+            time.sleep(retry_delay)
+
+    return last_result
+
+
+def append_employee_record(record: dict) -> dict:
+    with EMPLOYEES_FILE_LOCK:
+        records = merge_employee_lists(read_employees(), [record])
+        write_employees(records)
+        github_sync = github_sync_employees_with_retry(records)
+        merged_records = github_sync.get("merged_records")
+        if isinstance(merged_records, list):
+            write_employees(merged_records)
+            github_sync.pop("merged_records", None)
+    return github_sync
+
+
+def build_password_hash(password: str) -> tuple[str, str, int]:
+    iterations = max(120000, int(to_number(get_env("PASSWORD_HASH_ITERATIONS", "180000"), 180000)))
+    salt_bytes = os.urandom(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt_bytes, iterations)
+    return salt_bytes.hex(), digest.hex(), iterations
+
+
+def build_employee_record(payload: dict, created_iso: str) -> dict:
+    salt_hex, hash_hex, iterations = build_password_hash(payload.get("senha", ""))
+    phone_digits = normalize_employee_phone_digits(payload.get("numero_celular", ""))
+    return {
+        "id": uuid.uuid4().hex,
+        "nome": payload.get("nome", ""),
+        "funcao": payload.get("funcao", ""),
+        "numero_celular": payload.get("numero_celular", ""),
+        "numero_normalizado": phone_digits,
+        "email": payload.get("email", ""),
+        "senha": {
+            "algoritmo": "pbkdf2_sha256",
+            "salt": salt_hex,
+            "hash": hash_hex,
+            "iteracoes": iterations,
+        },
+        "data_cadastro_iso": created_iso,
+    }
+
+
+def build_employee_public_record(record: dict) -> dict:
+    return {
+        "id": str(record.get("id", "")).strip(),
+        "nome": str(record.get("nome", "")).strip(),
+        "funcao": str(record.get("funcao", "")).strip(),
+        "numero_celular": str(record.get("numero_celular", "")).strip(),
+        "email": str(record.get("email", "")).strip(),
+        "data_cadastro_iso": str(record.get("data_cadastro_iso", "")).strip(),
+    }
+
+
+def find_duplicate_employee(records: list, phone_digits: str, email: str) -> tuple[bool, str]:
+    email_normalized = str(email or "").strip().lower()
+    for item in records:
+        if not isinstance(item, dict):
+            continue
+        existing_phone = normalize_employee_phone_digits(item.get("numero_normalizado") or item.get("numero_celular") or "")
+        if phone_digits and existing_phone and existing_phone == phone_digits:
+            return True, "Ja existe cadastro com esse numero de celular."
+        existing_email = str(item.get("email", "") or "").strip().lower()
+        if email_normalized and existing_email and existing_email == email_normalized:
+            return True, "Ja existe cadastro com esse email."
+    return False, ""
+
+
+def find_employee_by_phone(records: list, phone_digits: str) -> dict | None:
+    for item in records:
+        if not isinstance(item, dict):
+            continue
+        existing_phone = normalize_employee_phone_digits(item.get("numero_normalizado") or item.get("numero_celular") or "")
+        if phone_digits and existing_phone == phone_digits:
+            return item
+    return None
+
+
+def find_employee_by_id(records: list, employee_id: str) -> dict | None:
+    wanted_id = str(employee_id or "").strip()
+    if not wanted_id:
+        return None
+    for item in records:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("id", "")).strip() == wanted_id:
+            return item
+    return None
+
+
+def verify_employee_password(record: dict, password: str) -> bool:
+    stored = record.get("senha")
+    plain_password = str(password or "")
+    if not plain_password:
+        return False
+
+    if isinstance(stored, dict):
+        algo = str(stored.get("algoritmo", "")).strip().lower()
+        salt_hex = str(stored.get("salt", "")).strip()
+        hash_hex = str(stored.get("hash", "")).strip().lower()
+        iterations = max(1, int(to_number(stored.get("iteracoes"), 180000)))
+        if algo == "pbkdf2_sha256" and salt_hex and hash_hex:
+            try:
+                salt_bytes = bytes.fromhex(salt_hex)
+            except ValueError:
+                return False
+            computed = hashlib.pbkdf2_hmac("sha256", plain_password.encode("utf-8"), salt_bytes, iterations).hex().lower()
+            return hmac.compare_digest(computed, hash_hex)
+        return False
+
+    # Backward compatibility if old records have plain string password.
+    if isinstance(stored, str):
+        return hmac.compare_digest(stored, plain_password)
+
+    return False
+
+
 def make_log_record(
     payload: dict,
     card_id: str,
@@ -1301,6 +1626,7 @@ def make_log_record(
 
 
 RANK_DATA_SOURCE_DEFAULT = "https://github.com/PopularAtacarejo/SuperPOP/blob/main/Dados.json"
+MY_SUPERPOPS_SOURCE_URL = "https://github.com/PopularAtacarejo/SuperPOP/blob/main/Dados.json"
 
 
 def normalize_name_key(name: str) -> str:
@@ -1465,29 +1791,268 @@ def build_rank_payload(logs: list, source_configured: str, source_resolved: str)
     }
 
 
+PT_BR_MONTH_NAMES = (
+    "janeiro",
+    "fevereiro",
+    "marco",
+    "abril",
+    "maio",
+    "junho",
+    "julho",
+    "agosto",
+    "setembro",
+    "outubro",
+    "novembro",
+    "dezembro",
+)
+
+
+def format_month_label(month_key: str) -> str:
+    match = re.fullmatch(r"(\d{4})-(\d{2})", str(month_key or "").strip())
+    if not match:
+        return str(month_key or "").strip()
+    year = int(match.group(1))
+    month = int(match.group(2))
+    if month < 1 or month > 12:
+        return str(month_key or "").strip()
+    return f"{PT_BR_MONTH_NAMES[month - 1]}/{year}"
+
+
+def extract_month_key_from_log(record: dict) -> str:
+    if not isinstance(record, dict):
+        return ""
+
+    dia_value = str(record.get("dia", "")).strip()
+    dia_match = re.fullmatch(r"(\d{2})/(\d{2})/(\d{4})", dia_value)
+    if dia_match:
+        year = int(dia_match.group(3))
+        month = int(dia_match.group(2))
+        if 1 <= month <= 12:
+            return f"{year:04d}-{month:02d}"
+
+    iso_value = str(record.get("data_hora_iso", "")).strip()
+    if iso_value:
+        iso_candidate = iso_value.replace("Z", "+00:00")
+        try:
+            parsed = datetime.fromisoformat(iso_candidate)
+            if parsed.tzinfo is not None:
+                parsed = parsed.astimezone(ZoneInfo("America/Sao_Paulo"))
+            return f"{parsed.year:04d}-{parsed.month:02d}"
+        except ValueError:
+            pass
+
+    timestamp = parse_log_timestamp(record)
+    if timestamp > 0:
+        parsed = datetime.fromtimestamp(timestamp, tz=ZoneInfo("America/Sao_Paulo"))
+        return f"{parsed.year:04d}-{parsed.month:02d}"
+
+    return ""
+
+
+def normalize_actor_number(value: object) -> str:
+    return normalize_whatsapp_number(str(value or "").strip())
+
+
+def log_matches_user(record: dict, user_name_key: str, user_number: str) -> tuple[bool, bool]:
+    if not isinstance(record, dict):
+        return False, False
+
+    remetente = record.get("remetente", {}) or {}
+    destinatario = record.get("destinatario", {}) or {}
+
+    sender_name_key = normalize_name_key(str(remetente.get("nome") or record.get("reconhecido_por") or ""))
+    receiver_name_key = normalize_name_key(str(destinatario.get("nome") or record.get("colaborador") or ""))
+    sender_number = normalize_actor_number(
+        remetente.get("numero_normalizado") or remetente.get("numero") or record.get("numero_reconhecido_por")
+    )
+    receiver_number = normalize_actor_number(
+        destinatario.get("numero_normalizado") or destinatario.get("numero") or record.get("numero_colaborador")
+    )
+
+    sender_match = False
+    receiver_match = False
+
+    if user_number:
+        sender_match = bool(sender_number and sender_number == user_number)
+        receiver_match = bool(receiver_number and receiver_number == user_number)
+
+    if user_name_key:
+        if not sender_match:
+            sender_match = bool(sender_name_key and sender_name_key == user_name_key)
+        if not receiver_match:
+            receiver_match = bool(receiver_name_key and receiver_name_key == user_name_key)
+
+    return sender_match, receiver_match
+
+
+def load_logs_for_history_view() -> tuple[list, dict]:
+    preferred_configured = MY_SUPERPOPS_SOURCE_URL
+    preferred_resolved = normalize_layout_source_url(preferred_configured)
+    configured_source, resolved_source = resolve_rank_data_source_url()
+
+    candidates: list[tuple[str, str]] = [(preferred_configured, preferred_resolved)]
+    if resolved_source != preferred_resolved:
+        candidates.append((configured_source, resolved_source))
+
+    remote_errors: list[str] = []
+    for configured, resolved in candidates:
+        remote_logs, error = fetch_rank_logs_remote(resolved)
+        if not error and isinstance(remote_logs, list):
+            return remote_logs, {
+                "tipo": "remoto",
+                "url_configurada": configured,
+                "url_resolvida": resolved,
+            }
+        remote_errors.append(error or f"Falha ao ler fonte remota: {resolved}")
+
+    return read_logs(), {
+        "tipo": "local",
+        "url_configurada": preferred_configured,
+        "url_resolvida": preferred_resolved,
+        "erro_remoto": " | ".join(item for item in remote_errors if item),
+    }
+
+
+def build_user_log_item(record: dict, role: str) -> dict:
+    destinatario = record.get("destinatario", {}) or {}
+    remetente = record.get("remetente", {}) or {}
+    arquivos = record.get("arquivos", {}) or {}
+    whatsapp = record.get("whatsapp", {}) or {}
+
+    other_actor = destinatario if role == "sent" else remetente
+    valores = record.get("opcoes_marcadas", [])
+    if not isinstance(valores, list):
+        valores = []
+
+    mensagem_value = str(record.get("mensagem", "")).strip()
+    if mensagem_value == "-":
+        mensagem_value = ""
+
+    return {
+        "id": str(record.get("id", "")).strip(),
+        "card_id": str(record.get("card_id", "")).strip(),
+        "dia": str(record.get("dia", "")).strip(),
+        "horario": str(record.get("horario", "")).strip(),
+        "data_hora_iso": str(record.get("data_hora_iso", "")).strip(),
+        "papel": role,
+        "outra_pessoa": {
+            "nome": str(other_actor.get("nome", "")).strip(),
+            "numero": str(other_actor.get("numero", "")).strip(),
+            "funcao": str(other_actor.get("funcao", "")).strip(),
+        },
+        "valores": [str(item).strip() for item in valores if str(item).strip()],
+        "mensagem": mensagem_value,
+        "whatsapp": {
+            "status": str(whatsapp.get("status", "")).strip(),
+            "to": str(whatsapp.get("to", "")).strip(),
+            "error": str(whatsapp.get("error", "")).strip(),
+        },
+        "arquivos": {
+            "image_url": str(arquivos.get("image_url", "")).strip(),
+            "uploaded_image_url": str(arquivos.get("uploaded_image_url", "")).strip(),
+            "auth_qr_url": str(arquivos.get("auth_qr_url", "")).strip(),
+        },
+    }
+
+
 app = Flask(__name__)
+app.secret_key = get_env("FLASK_SECRET_KEY", "superpop-dev-secret")
+session_hours = max(1.0, to_number(get_env("AUTH_SESSION_HOURS", "24"), 24.0))
+app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(hours=session_hours)
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config["SESSION_COOKIE_SECURE"] = to_bool(get_env("SESSION_COOKIE_SECURE", "0"), False)
+app.config["SESSION_REFRESH_EACH_REQUEST"] = True
 CORS(app)
+
+
+def is_user_logged_in() -> bool:
+    return bool(session.get("auth_user_id"))
+
+
+def require_login_redirect():
+    if not is_user_logged_in():
+        return redirect(url_for("serve_login_page"))
+    return None
 
 
 @app.get("/")
 def serve_superpop_home():
-    return send_from_directory(BASE_DIR, "superpop.html")
+    if is_user_logged_in():
+        return redirect(url_for("serve_superpop_file"))
+    return redirect(url_for("serve_login_page"))
 
 
 @app.get("/superpop.html")
 def serve_superpop_file():
+    blocked = require_login_redirect()
+    if blocked:
+        return blocked
     return send_from_directory(BASE_DIR, "superpop.html")
 
 
 @app.get("/rank")
 @app.get("/rank.html")
 def serve_rank_page():
+    blocked = require_login_redirect()
+    if blocked:
+        return blocked
     return send_from_directory(BASE_DIR, "rank.html")
+
+
+@app.get("/ganhadores")
+@app.get("/ganhadores.html")
+def serve_month_winners_page():
+    blocked = require_login_redirect()
+    if blocked:
+        return blocked
+    return send_from_directory(BASE_DIR, "ganhadores.html")
+
+
+@app.get("/meus-superpops")
+@app.get("/meus-superpops.html")
+def serve_my_superpops_page():
+    blocked = require_login_redirect()
+    if blocked:
+        return blocked
+    return send_from_directory(BASE_DIR, "meus-superpops.html")
+
+
+@app.get("/cadastro")
+@app.get("/cadastro.html")
+def serve_register_page():
+    if is_user_logged_in():
+        return redirect(url_for("serve_superpop_file"))
+    return send_from_directory(BASE_DIR, "cadastro.html")
+
+
+@app.get("/login")
+@app.get("/login.html")
+def serve_login_page():
+    if is_user_logged_in():
+        return redirect(url_for("serve_superpop_file"))
+    return send_from_directory(BASE_DIR, "login.html")
+
+
+@app.get("/acesso")
+@app.get("/acesso.html")
+def serve_access_page():
+    return redirect(url_for("serve_login_page"))
 
 
 @app.get("/Dados.json")
 def serve_dados_file():
     return send_from_directory(BASE_DIR, "Dados.json")
+
+
+@app.get("/FuncoesSupermercado.json")
+def serve_funcoes_supermercado_file():
+    return send_from_directory(BASE_DIR, "FuncoesSupermercado.json")
+
+
+@app.get("/Funcioinarios.json")
+def serve_funcioinarios_file():
+    return send_from_directory(BASE_DIR, "Funcioinarios.json")
 
 
 @app.get("/health")
@@ -1600,6 +2165,251 @@ def api_rank():
     return jsonify(build_rank_payload(logs, configured_source, resolved_source))
 
 
+@app.get("/api/me/superpops")
+def api_my_superpops():
+    if not is_user_logged_in():
+        return jsonify({"ok": False, "error": "Nao autenticado."}), 401
+
+    month_param = str(request.args.get("month", "")).strip()
+    if month_param:
+        month_match = re.fullmatch(r"(\d{4})-(\d{2})", month_param)
+        if not month_match:
+            return jsonify({"ok": False, "error": "Parametro month invalido. Use YYYY-MM."}), 400
+        month_number = int(month_match.group(2))
+        if month_number < 1 or month_number > 12:
+            return jsonify({"ok": False, "error": "Parametro month invalido. Mes fora do intervalo."}), 400
+
+    auth_user_id = str(session.get("auth_user_id", "")).strip()
+    auth_user_nome = str(session.get("auth_user_nome", "")).strip()
+    auth_user_funcao = str(session.get("auth_user_funcao", "")).strip()
+    auth_user_numero = str(session.get("auth_user_numero", "")).strip()
+
+    if auth_user_id and (not auth_user_nome or not auth_user_numero):
+        with EMPLOYEES_FILE_LOCK:
+            employee = find_employee_by_id(read_employees(), auth_user_id)
+        if employee:
+            public_employee = build_employee_public_record(employee)
+            auth_user_nome = public_employee.get("nome", "")
+            auth_user_funcao = public_employee.get("funcao", "")
+            auth_user_numero = public_employee.get("numero_celular", "")
+            session["auth_user_nome"] = auth_user_nome
+            session["auth_user_funcao"] = auth_user_funcao
+            session["auth_user_numero"] = auth_user_numero
+
+    if not auth_user_nome and not auth_user_numero:
+        return jsonify({"ok": False, "error": "Sessao invalida. Faca login novamente."}), 401
+
+    logs, source_info = load_logs_for_history_view()
+    current_month_key = now_brazil().strftime("%Y-%m")
+    selected_month_key = month_param or current_month_key
+    user_name_key = normalize_name_key(auth_user_nome)
+    user_number = normalize_whatsapp_number(auth_user_numero)
+
+    month_counters: dict[str, dict] = {}
+    sent_records: list[dict] = []
+    received_records: list[dict] = []
+
+    for record in logs:
+        if not isinstance(record, dict):
+            continue
+
+        sender_match, receiver_match = log_matches_user(record, user_name_key, user_number)
+        if not sender_match and not receiver_match:
+            continue
+
+        month_key = extract_month_key_from_log(record)
+        if not month_key:
+            continue
+
+        if month_key not in month_counters:
+            month_counters[month_key] = {
+                "chave": month_key,
+                "label": format_month_label(month_key),
+                "total_registros": 0,
+                "enviados": 0,
+                "recebidos": 0,
+            }
+
+        month_counters[month_key]["total_registros"] += 1
+        if sender_match:
+            month_counters[month_key]["enviados"] += 1
+        if receiver_match:
+            month_counters[month_key]["recebidos"] += 1
+
+        if month_key == selected_month_key:
+            if sender_match:
+                sent_records.append(record)
+            if receiver_match:
+                received_records.append(record)
+
+    if current_month_key not in month_counters:
+        month_counters[current_month_key] = {
+            "chave": current_month_key,
+            "label": format_month_label(current_month_key),
+            "total_registros": 0,
+            "enviados": 0,
+            "recebidos": 0,
+        }
+
+    if selected_month_key not in month_counters:
+        month_counters[selected_month_key] = {
+            "chave": selected_month_key,
+            "label": format_month_label(selected_month_key),
+            "total_registros": 0,
+            "enviados": 0,
+            "recebidos": 0,
+        }
+
+    sent_records.sort(key=parse_log_timestamp, reverse=True)
+    received_records.sort(key=parse_log_timestamp, reverse=True)
+    sent_items = [build_user_log_item(record, role="sent") for record in sent_records]
+    received_items = [build_user_log_item(record, role="received") for record in received_records]
+    months_available = [month_counters[key] for key in sorted(month_counters.keys(), reverse=True)]
+
+    return jsonify(
+        {
+            "ok": True,
+            "usuario": {
+                "id": auth_user_id,
+                "nome": auth_user_nome,
+                "funcao": auth_user_funcao,
+                "numero_celular": auth_user_numero,
+            },
+            "mes_atual": current_month_key,
+            "mes_selecionado": selected_month_key,
+            "meses_disponiveis": months_available,
+            "resumo_mes": month_counters[selected_month_key],
+            "enviados": sent_items,
+            "recebidos": received_items,
+            "fonte": source_info,
+        }
+    )
+
+
+@app.post("/api/funcionarios/register")
+def register_employee():
+    payload = normalize_employee_payload(request.get_json(silent=True) or {})
+    valid, validation_error = validate_employee_payload(payload)
+    if not valid:
+        return jsonify({"ok": False, "error": validation_error}), 400
+
+    phone_digits = normalize_employee_phone_digits(payload.get("numero_celular", ""))
+    with EMPLOYEES_FILE_LOCK:
+        existing_records = read_employees()
+        duplicated, duplicate_error = find_duplicate_employee(existing_records, phone_digits, payload.get("email", ""))
+        if duplicated:
+            return jsonify({"ok": False, "error": duplicate_error, "duplicate": True}), 409
+
+    created_iso = now_brazil().isoformat()
+    employee_record = build_employee_record(payload, created_iso)
+    github_sync = append_employee_record(employee_record)
+    github_synced = bool(github_sync.get("synced"))
+    github_required = is_github_sync_required()
+
+    if github_required and not github_synced:
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": "Falha ao sincronizar Funcioinarios.json com o GitHub. Cadastro salvo apenas localmente.",
+                    "saved_local": True,
+                    "github_sync": github_sync,
+                    "funcionario": build_employee_public_record(employee_record),
+                }
+            ),
+            503,
+        )
+
+    return jsonify(
+        {
+            "ok": True,
+            "funcionario": build_employee_public_record(employee_record),
+            "github_sync": github_sync,
+        }
+    )
+
+
+@app.post("/api/auth/login")
+def login_employee():
+    payload = request.get_json(silent=True) or {}
+    phone_raw = str(payload.get("numero_celular", "") or "").strip()
+    password_raw = str(payload.get("senha", "") or "")
+    keep_connected = to_bool(payload.get("manter_conectado"), True)
+    phone_digits = normalize_employee_phone_digits(phone_raw)
+
+    if len(phone_digits) != 11 or (phone_digits and phone_digits[2] != "9"):
+        return jsonify({"ok": False, "error": "Numero de celular invalido."}), 400
+    if not password_raw:
+        return jsonify({"ok": False, "error": "Senha obrigatoria."}), 400
+
+    with EMPLOYEES_FILE_LOCK:
+        records = read_employees()
+        employee = find_employee_by_phone(records, phone_digits)
+
+    if not employee:
+        return jsonify({"ok": False, "error": "Usuario ou senha invalidos."}), 401
+
+    if not verify_employee_password(employee, password_raw):
+        return jsonify({"ok": False, "error": "Usuario ou senha invalidos."}), 401
+
+    public_employee = build_employee_public_record(employee)
+    session.permanent = keep_connected
+    session["auth_user_id"] = public_employee.get("id", "")
+    session["auth_user_nome"] = public_employee.get("nome", "")
+    session["auth_user_funcao"] = public_employee.get("funcao", "")
+    session["auth_user_numero"] = public_employee.get("numero_celular", "")
+    session["auth_login_at"] = now_brazil().isoformat()
+
+    return jsonify(
+        {
+            "ok": True,
+            "funcionario": public_employee,
+        }
+    )
+
+
+@app.get("/api/auth/me")
+def auth_me():
+    if not is_user_logged_in():
+        return jsonify({"ok": False, "error": "Nao autenticado."}), 401
+
+    auth_user_id = str(session.get("auth_user_id", "")).strip()
+    auth_user_nome = str(session.get("auth_user_nome", "")).strip()
+    auth_user_funcao = str(session.get("auth_user_funcao", "")).strip()
+    auth_user_numero = str(session.get("auth_user_numero", "")).strip()
+
+    if auth_user_id and (not auth_user_nome or not auth_user_numero):
+        with EMPLOYEES_FILE_LOCK:
+            employee = find_employee_by_id(read_employees(), auth_user_id)
+        if employee:
+            public_employee = build_employee_public_record(employee)
+            auth_user_nome = public_employee.get("nome", "")
+            auth_user_funcao = public_employee.get("funcao", "")
+            auth_user_numero = public_employee.get("numero_celular", "")
+            session["auth_user_nome"] = auth_user_nome
+            session["auth_user_funcao"] = auth_user_funcao
+            session["auth_user_numero"] = auth_user_numero
+
+    return jsonify(
+        {
+            "ok": True,
+            "usuario": {
+                "id": auth_user_id,
+                "nome": auth_user_nome,
+                "funcao": auth_user_funcao,
+                "numero_celular": auth_user_numero,
+                "login_at": str(session.get("auth_login_at", "")).strip(),
+            },
+        }
+    )
+
+
+@app.post("/api/auth/logout")
+def auth_logout():
+    session.clear()
+    return jsonify({"ok": True})
+
+
 @app.post("/api/cards/generate")
 def generate_card():
     payload = normalize_payload(request.get_json(silent=True) or {})
@@ -1624,7 +2434,35 @@ def generate_card():
 
 @app.post("/api/logs/register")
 def register_log():
+    if not is_user_logged_in():
+        return jsonify({"ok": False, "error": "Nao autenticado."}), 401
+
     payload = normalize_payload(request.get_json(silent=True) or {})
+    auth_user_id = str(session.get("auth_user_id", "")).strip()
+    auth_user_nome = str(session.get("auth_user_nome", "")).strip()
+    auth_user_funcao = str(session.get("auth_user_funcao", "")).strip()
+    auth_user_numero = str(session.get("auth_user_numero", "")).strip()
+
+    if auth_user_id and (not auth_user_nome or not auth_user_numero):
+        with EMPLOYEES_FILE_LOCK:
+            employee = find_employee_by_id(read_employees(), auth_user_id)
+        if employee:
+            public_employee = build_employee_public_record(employee)
+            auth_user_nome = public_employee.get("nome", "")
+            auth_user_funcao = public_employee.get("funcao", "")
+            auth_user_numero = public_employee.get("numero_celular", "")
+            session["auth_user_nome"] = auth_user_nome
+            session["auth_user_funcao"] = auth_user_funcao
+            session["auth_user_numero"] = auth_user_numero
+
+    if not auth_user_nome or not auth_user_numero:
+        return jsonify({"ok": False, "error": "Sessao invalida. Faca login novamente."}), 401
+
+    payload["reconhecido_por"] = auth_user_nome
+    payload["funcao_reconhecido_por"] = auth_user_funcao
+    payload["numero_reconhecido_por"] = auth_user_numero
+    payload = normalize_payload(payload)
+
     local_now = now_brazil()
     local_date = payload["data"] or local_now.strftime("%d/%m/%Y")
     local_time = local_now.strftime("%H:%M:%S")
