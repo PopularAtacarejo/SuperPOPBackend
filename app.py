@@ -2011,10 +2011,35 @@ app.secret_key = get_env("FLASK_SECRET_KEY", "superpop-dev-secret")
 session_hours = max(1.0, to_number(get_env("AUTH_SESSION_HOURS", "24"), 24.0))
 app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(hours=session_hours)
 app.config["SESSION_COOKIE_HTTPONLY"] = True
-app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
-app.config["SESSION_COOKIE_SECURE"] = to_bool(get_env("SESSION_COOKIE_SECURE", "0"), False)
+session_cookie_samesite_raw = get_env("SESSION_COOKIE_SAMESITE", "None").strip().lower()
+if session_cookie_samesite_raw not in {"lax", "strict", "none"}:
+    session_cookie_samesite_raw = "none"
+session_cookie_samesite = "None" if session_cookie_samesite_raw == "none" else session_cookie_samesite_raw.capitalize()
+session_cookie_secure_default = session_cookie_samesite_raw == "none"
+app.config["SESSION_COOKIE_SAMESITE"] = session_cookie_samesite
+app.config["SESSION_COOKIE_SECURE"] = to_bool(
+    get_env("SESSION_COOKIE_SECURE", "1" if session_cookie_secure_default else "0"),
+    session_cookie_secure_default,
+)
 app.config["SESSION_REFRESH_EACH_REQUEST"] = True
-CORS(app)
+cors_origins_raw = get_env(
+    "CORS_ALLOWED_ORIGINS",
+    "https://superpopbackend.onrender.com,http://127.0.0.1:5500,http://localhost:5500,http://127.0.0.1:5000,http://localhost:5000",
+)
+cors_allowed_origins = [item.strip() for item in cors_origins_raw.split(",") if item.strip()]
+if not cors_allowed_origins:
+    cors_allowed_origins = ["https://superpopbackend.onrender.com"]
+CORS(
+    app,
+    supports_credentials=True,
+    resources={
+        r"/api/*": {"origins": cors_allowed_origins},
+        r"/health": {"origins": cors_allowed_origins},
+        r"/Dados.json": {"origins": cors_allowed_origins},
+        r"/Funcioinarios.json": {"origins": cors_allowed_origins},
+        r"/FuncoesSupermercado.json": {"origins": cors_allowed_origins},
+    },
+)
 
 
 def is_user_logged_in() -> bool:
