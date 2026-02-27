@@ -1627,6 +1627,7 @@ def make_log_record(
 
 RANK_DATA_SOURCE_DEFAULT = "https://github.com/PopularAtacarejo/SuperPOP/blob/main/Dados.json"
 MY_SUPERPOPS_SOURCE_URL = "https://github.com/PopularAtacarejo/SuperPOP/blob/main/Dados.json"
+EMPLOYEES_DATA_SOURCE_DEFAULT = "https://github.com/PopularAtacarejo/SuperPOP/blob/main/Funcioinarios.json"
 
 
 def normalize_name_key(name: str) -> str:
@@ -1690,6 +1691,56 @@ def fetch_rank_logs_remote(source_url: str) -> tuple[list, str]:
         return [], "Fonte remota nao retornou uma lista de registros."
 
     return loaded, ""
+
+
+def resolve_employees_data_source_url() -> tuple[str, str]:
+    configured = get_env("EMPLOYEES_DATA_SOURCE_URL", EMPLOYEES_DATA_SOURCE_DEFAULT)
+    resolved = normalize_layout_source_url(configured)
+    return configured, resolved
+
+
+def fetch_employees_remote(source_url: str) -> tuple[list, str]:
+    if not source_url:
+        return [], "URL da fonte de funcionarios nao foi configurada."
+
+    timeout_seconds = max(5.0, to_number(get_env("EMPLOYEES_SOURCE_TIMEOUT_SECONDS", "20"), 20.0))
+    request_obj = urllib.request.Request(
+        source_url,
+        headers={"User-Agent": "superpop-backend-employees-fetcher", "Accept": "application/json"},
+        method="GET",
+    )
+
+    try:
+        with urllib.request.urlopen(request_obj, timeout=timeout_seconds) as response:
+            payload = response.read().decode("utf-8")
+            loaded = json.loads(payload) if payload else []
+    except urllib.error.HTTPError as exc:
+        return [], f"Falha ao ler fonte remota de funcionarios (HTTP {exc.code})."
+    except json.JSONDecodeError:
+        return [], "Fonte remota de funcionarios retornou JSON invalido."
+    except Exception as exc:  # noqa: BLE001
+        return [], f"Falha ao ler fonte remota de funcionarios: {exc}"
+
+    if isinstance(loaded, dict) and isinstance(loaded.get("funcionarios"), list):
+        loaded = loaded.get("funcionarios")
+
+    if not isinstance(loaded, list):
+        return [], "Fonte remota de funcionarios nao retornou uma lista."
+
+    records = [item for item in loaded if isinstance(item, dict)]
+    return records, ""
+
+
+def refresh_local_employees_from_remote(existing_records: list) -> tuple[list, str]:
+    configured_source, resolved_source = resolve_employees_data_source_url()
+    remote_records, error = fetch_employees_remote(resolved_source)
+    if error:
+        return existing_records, error
+
+    merged_records = merge_employee_lists(existing_records, remote_records)
+    if merged_records != existing_records:
+        write_employees(merged_records)
+    return merged_records, ""
 
 
 def pick_actor_name(record: dict, actor: str) -> str:
@@ -2028,10 +2079,12 @@ def serve_register_page():
 
 @app.get("/login")
 @app.get("/login.html")
+@app.get("/index")
+@app.get("/index.html")
 def serve_login_page():
     if is_user_logged_in():
         return redirect(url_for("serve_superpop_file"))
-    return send_from_directory(BASE_DIR, "login.html")
+    return send_from_directory(BASE_DIR, "index.html")
 
 
 @app.get("/acesso")
@@ -2345,6 +2398,10 @@ def login_employee():
     with EMPLOYEES_FILE_LOCK:
         records = read_employees()
         employee = find_employee_by_phone(records, phone_digits)
+        if not employee:
+            refreshed_records, _refresh_error = refresh_local_employees_from_remote(records)
+            records = refreshed_records
+            employee = find_employee_by_phone(records, phone_digits)
 
     if not employee:
         return jsonify({"ok": False, "error": "Usuario ou senha invalidos."}), 401
