@@ -374,14 +374,15 @@ def build_whatsapp_caption(payload: dict) -> str:
     message_text = (payload.get("mensagem", "") or "").strip()
 
     lines = [
-        f"SuperPOP - Reconhecimento",
-        f"Colaborador: {collaborator}",
-        f"Reconhecido por: {recognized_by}",
-        f"Valores: {values_text}",
-        f"Data: {date_text}",
+        "🎉 *SuperPOP - Reconhecimento*",
+        "",
+        f"👤 *Para:* {collaborator}",
+        f"🙌 *Enviado por:* {recognized_by}",
+        f"⭐ *Valores:* {values_text}",
+        f"📅 *Data:* {date_text}",
     ]
     if message_text:
-        lines.append(f"Mensagem: {message_text}")
+        lines.extend(["", "💬 *Mensagem:*", message_text])
 
     return "\n".join(lines)
 
