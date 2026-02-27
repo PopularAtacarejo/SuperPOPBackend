@@ -30,7 +30,12 @@ TEMPLATE_CACHE_DIR = BASE_DIR / "generated" / "templates"
 TEMPLATE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 DATA_FILE = BASE_DIR / "Dados.json"
 DATA_FILE_LOCK = threading.Lock()
-DEFAULT_TEMPLATE_PATH = Path(r"C:\Users\marke\OneDrive\Desktop\SuperPOP.png")
+PENDING_SEND_KEYS: set[str] = set()
+DEFAULT_TEMPLATE_PATHS = [
+    BASE_DIR / "assets" / "Super-POP.png",
+    BASE_DIR / "SuperPOP.png",
+    Path(r"C:\Users\marke\OneDrive\Desktop\SuperPOP.png"),
+]
 DOTENV_PATH = BASE_DIR / ".env"
 LAYOUT_FILE = BASE_DIR / "layout.json"
 LAYOUT_CACHE_LOCK = threading.Lock()
@@ -240,6 +245,19 @@ def to_number(value: object, default: float) -> float:
         return default
 
 
+def to_bool(value: object, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if text in {"1", "true", "t", "yes", "y", "on", "sim", "s"}:
+        return True
+    if text in {"0", "false", "f", "no", "n", "off", "nao", "não"}:
+        return False
+    return default
+
+
 def get_default_country_code() -> str:
     digits = re.sub(r"\D+", "", get_env("WHATSAPP_DEFAULT_COUNTRY_CODE", "55"))
     return digits or "55"
@@ -248,6 +266,11 @@ def get_default_country_code() -> str:
 def get_default_area_code() -> str:
     digits = re.sub(r"\D+", "", get_env("WHATSAPP_DEFAULT_AREA_CODE", "82"))
     return digits or "82"
+
+
+def get_whatsapp_send_mode() -> str:
+    mode = get_env("WHATSAPP_SEND_MODE", "wa_me").lower()
+    return mode if mode in {"wa_me", "webjs"} else "wa_me"
 
 
 def get_card_auth_secret() -> str:
@@ -342,6 +365,144 @@ def normalize_whatsapp_digits(raw: str) -> str:
     return f"{country_code}{area_code}{digits}"
 
 
+def build_whatsapp_caption(payload: dict) -> str:
+    collaborator = payload.get("colaborador", "") or "-"
+    recognized_by = payload.get("reconhecido_por", "") or "-"
+    values = payload.get("valores", [])
+    values_text = ", ".join(values) if isinstance(values, list) and values else "-"
+    date_text = payload.get("data", "") or now_brazil().strftime("%d/%m/%Y")
+    message_text = (payload.get("mensagem", "") or "").strip()
+
+    lines = [
+        f"SuperPOP - Reconhecimento",
+        f"Colaborador: {collaborator}",
+        f"Reconhecido por: {recognized_by}",
+        f"Valores: {values_text}",
+        f"Data: {date_text}",
+    ]
+    if message_text:
+        lines.append(f"Mensagem: {message_text}")
+
+    return "\n".join(lines)
+
+
+def post_json_request(url: str, payload: dict, headers: dict | None = None, timeout: float = 30.0) -> tuple[int, dict | None, str]:
+    body = json.dumps(payload).encode("utf-8")
+    merged_headers = {"Content-Type": "application/json"}
+    if headers:
+        merged_headers.update(headers)
+
+    request_obj = urllib.request.Request(url, data=body, headers=merged_headers, method="POST")
+
+    try:
+        with urllib.request.urlopen(request_obj, timeout=timeout) as response:
+            raw = response.read().decode("utf-8")
+            parsed = json.loads(raw) if raw else {}
+            return int(getattr(response, "status", 200) or 200), (parsed if isinstance(parsed, dict) else None), ""
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8")
+        except Exception:
+            pass
+        parsed = None
+        if detail:
+            try:
+                maybe_json = json.loads(detail)
+                if isinstance(maybe_json, dict):
+                    parsed = maybe_json
+            except Exception:
+                pass
+        return exc.code, parsed, detail or str(exc.reason)
+    except Exception as exc:
+        return 0, None, str(exc)
+
+
+def get_json_request(url: str, headers: dict | None = None, timeout: float = 20.0) -> tuple[int, dict | None, str]:
+    request_obj = urllib.request.Request(url, headers=headers or {}, method="GET")
+
+    try:
+        with urllib.request.urlopen(request_obj, timeout=timeout) as response:
+            raw = response.read().decode("utf-8")
+            parsed = json.loads(raw) if raw else {}
+            return int(getattr(response, "status", 200) or 200), (parsed if isinstance(parsed, dict) else None), ""
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8")
+        except Exception:
+            pass
+        parsed = None
+        if detail:
+            try:
+                maybe_json = json.loads(detail)
+                if isinstance(maybe_json, dict):
+                    parsed = maybe_json
+            except Exception:
+                pass
+        return exc.code, parsed, detail or str(exc.reason)
+    except Exception as exc:
+        return 0, None, str(exc)
+
+
+def send_image_via_whatsapp_webjs(destination: str, image_url: str, caption: str) -> dict:
+    api_base = get_env("WHATSAPP_WEBJS_API_URL")
+    if not api_base:
+        return {
+            "enabled": False,
+            "ok": False,
+            "error": "WHATSAPP_WEBJS_API_URL nao configurado.",
+            "message_id": "",
+            "to": destination or "",
+            "provider": "whatsapp-web.js",
+        }
+
+    endpoint = f"{api_base.rstrip('/')}/send-image"
+    api_token = get_env("WHATSAPP_WEBJS_API_TOKEN")
+    headers = {}
+    if api_token:
+        headers["Authorization"] = f"Bearer {api_token}"
+
+    timeout_seconds = max(5.0, to_number(get_env("WHATSAPP_WEBJS_TIMEOUT_SECONDS", "45"), 45.0))
+    status_code, response_payload, response_error = post_json_request(
+        url=endpoint,
+        payload={
+            "to": destination,
+            "image_url": image_url,
+            "caption": caption,
+            "filename": "superpop.png",
+            "mime_type": "image/png",
+        },
+        headers=headers,
+        timeout=timeout_seconds,
+    )
+
+    if status_code >= 200 and status_code < 300 and isinstance(response_payload, dict) and response_payload.get("ok"):
+        return {
+            "enabled": True,
+            "ok": True,
+            "error": "",
+            "message_id": str(response_payload.get("message_id", "")).strip(),
+            "to": str(response_payload.get("to", destination)).strip(),
+            "provider": str(response_payload.get("provider", "whatsapp-web.js")).strip() or "whatsapp-web.js",
+        }
+
+    backend_error = ""
+    if isinstance(response_payload, dict):
+        backend_error = str(response_payload.get("error", "")).strip()
+    if not backend_error:
+        backend_error = response_error or f"Falha no servico whatsapp-web.js (HTTP {status_code})."
+
+    return {
+        "enabled": True,
+        "ok": False,
+        "error": backend_error,
+        "message_id": "",
+        "to": destination or "",
+        "provider": "whatsapp-web.js",
+    }
+
+
 def resolve_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
     candidates = ["arialbd.ttf", "DejaVuSans-Bold.ttf"] if bold else ["arial.ttf", "DejaVuSans.ttf"]
     for candidate in candidates:
@@ -377,6 +538,7 @@ def normalize_payload(payload: dict) -> dict:
         "data": str(payload.get("data", "")).strip(),
         "to": normalized_to or normalized_num_colaborador or raw_to,
         "format": str(payload.get("format", "image")).strip().lower(),
+        "send_mode": str(payload.get("send_mode", "")).strip().lower(),
     }
 
 
@@ -631,6 +793,7 @@ def create_card_image_from_template(data: dict, image_path: Path, template_path:
         return plain.lower().strip()
 
     line_font = resolve_font(max(20, int(30 * ((sx + sy) / 2))), bold=True)
+    name_font = resolve_font(max(18, int(24 * ((sx + sy) / 2))), bold=True)
     message_font = resolve_font(max(18, int(24 * ((sx + sy) / 2))))
     collaborator_base = to_pair(text_layout.get("collaborator_baseline"), (278.0, 306.0))
     recognized_base = to_pair(text_layout.get("recognized_baseline"), (265.0, 345.0))
@@ -649,19 +812,20 @@ def create_card_image_from_template(data: dict, image_path: Path, template_path:
     collaborator_max_x = to_number(text_layout.get("collaborator_max_x"), 474.0)
     recognized_max_x = to_number(text_layout.get("recognized_max_x"), 530.0)
     date_max_x = to_number(text_layout.get("date_max_x"), 938.0)
-    collaborator_view = fit_text_to_width(collaborator_view, line_font, px(max(1.0, collaborator_max_x - collaborator_base[0])))
-    recognized_view = fit_text_to_width(recognized_view, line_font, px(max(1.0, recognized_max_x - recognized_base[0])))
+    collaborator_view = fit_text_to_width(collaborator_view, name_font, px(max(1.0, collaborator_max_x - collaborator_base[0])))
+    recognized_view = fit_text_to_width(recognized_view, name_font, px(max(1.0, recognized_max_x - recognized_base[0])))
     date_view = fit_text_to_width(date_view, line_font, px(max(1.0, date_max_x - date_base[0])))
 
     try:
-        draw.text((collaborator_line_x, collaborator_line_y), collaborator_view, font=line_font, fill="#1f2937", anchor="ls")
-        draw.text((recognized_line_x, recognized_line_y), recognized_view, font=line_font, fill="#1f2937", anchor="ls")
+        draw.text((collaborator_line_x, collaborator_line_y), collaborator_view, font=name_font, fill="#1f2937", anchor="ls")
+        draw.text((recognized_line_x, recognized_line_y), recognized_view, font=name_font, fill="#1f2937", anchor="ls")
         draw.text((date_line_x, date_line_y), date_view, font=line_font, fill="#1f2937", anchor="ls")
     except Exception:
-        ascent = int(getattr(line_font, "size", 30) * 0.75)
-        draw.text((collaborator_line_x, collaborator_line_y - ascent), collaborator_view, font=line_font, fill="#1f2937")
-        draw.text((recognized_line_x, recognized_line_y - ascent), recognized_view, font=line_font, fill="#1f2937")
-        draw.text((date_line_x, date_line_y - ascent), date_view, font=line_font, fill="#1f2937")
+        name_ascent = int(getattr(name_font, "size", 24) * 0.75)
+        date_ascent = int(getattr(line_font, "size", 30) * 0.75)
+        draw.text((collaborator_line_x, collaborator_line_y - name_ascent), collaborator_view, font=name_font, fill="#1f2937")
+        draw.text((recognized_line_x, recognized_line_y - name_ascent), recognized_view, font=name_font, fill="#1f2937")
+        draw.text((date_line_x, date_line_y - date_ascent), date_view, font=line_font, fill="#1f2937")
 
     selected = {normalize_value_key(v) for v in data["valores"]}
     checkbox_centers = checkbox_layout.get("centers", {})
@@ -781,11 +945,18 @@ def resolve_card_template_path() -> Path | None:
                 return downloaded_path
         else:
             local_template = Path(template_env)
+            if not local_template.is_absolute():
+                local_template = BASE_DIR / local_template
             if local_template.exists():
                 return local_template
 
-    if DEFAULT_TEMPLATE_PATH.exists():
-        return DEFAULT_TEMPLATE_PATH
+    for default_path in DEFAULT_TEMPLATE_PATHS:
+        if default_path.exists():
+            return default_path
+
+    cached_templates = sorted(TEMPLATE_CACHE_DIR.glob("template-*.png"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if cached_templates:
+        return cached_templates[0]
 
     return None
 
@@ -868,6 +1039,85 @@ def read_logs() -> list:
         return []
 
 
+def build_daily_send_key(sender_number: str, destination_number: str, day_value: str) -> str:
+    sender = str(sender_number or "").strip()
+    destination = str(destination_number or "").strip()
+    day = str(day_value or "").strip()
+    if not sender or not destination or not day:
+        return ""
+    return f"{day}|{sender}|{destination}"
+
+
+def find_duplicate_send_same_day(logs: list, sender_number: str, destination_number: str, day_value: str) -> dict | None:
+    if not sender_number or not destination_number or not day_value:
+        return None
+
+    for record in reversed(logs):
+        if not isinstance(record, dict):
+            continue
+
+        day = str(record.get("dia", "")).strip()
+        if day != day_value:
+            continue
+
+        remetente = record.get("remetente", {}) or {}
+        destinatario = record.get("destinatario", {}) or {}
+
+        sender_saved = normalize_whatsapp_number(
+            str(remetente.get("numero_normalizado") or remetente.get("numero") or "")
+        )
+        destination_saved = normalize_whatsapp_number(
+            str(destinatario.get("numero_normalizado") or destinatario.get("numero") or "")
+        )
+
+        if sender_saved == sender_number and destination_saved == destination_number:
+            return record
+
+    return None
+
+
+def log_record_key(record: dict) -> str:
+    if not isinstance(record, dict):
+        return ""
+
+    record_id = str(record.get("id", "")).strip()
+    if record_id:
+        return f"id:{record_id}"
+
+    card_id = str(record.get("card_id", "")).strip()
+    if card_id:
+        return f"card:{card_id}"
+
+    iso_value = str(record.get("data_hora_iso", "")).strip()
+    if iso_value:
+        return f"iso:{iso_value}"
+
+    try:
+        # Last-resort stable key for older records without id/card_id.
+        return "raw:" + json.dumps(record, ensure_ascii=False, sort_keys=True)
+    except Exception:  # noqa: BLE001
+        return "raw:" + str(record)
+
+
+def merge_log_lists(*sources: list) -> list:
+    merged: list = []
+    seen: set[str] = set()
+
+    for source in sources:
+        if not isinstance(source, list):
+            continue
+        for item in source:
+            if not isinstance(item, dict):
+                continue
+            key = log_record_key(item)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            merged.append(item)
+
+    return merged
+
+
 def write_logs(logs: list) -> None:
     temp_file = DATA_FILE.with_suffix(".tmp")
     temp_file.write_text(json.dumps(logs, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -891,18 +1141,40 @@ def github_sync_logs(logs: list) -> dict:
     }
 
     sha = None
+    remote_logs: list = []
     try:
         req_get = urllib.request.Request(get_url, headers=headers, method="GET")
         with urllib.request.urlopen(req_get, timeout=20) as resp:
             current = json.loads(resp.read().decode("utf-8"))
             sha = current.get("sha")
+            encoded_content = str(current.get("content") or "").strip()
+            if encoded_content:
+                try:
+                    decoded_content = base64.b64decode(encoded_content).decode("utf-8")
+                    loaded_remote = json.loads(decoded_content)
+                    if isinstance(loaded_remote, list):
+                        remote_logs = loaded_remote
+                except Exception:  # noqa: BLE001
+                    remote_logs = []
+            if not remote_logs:
+                download_url = str(current.get("download_url") or "").strip()
+                if download_url:
+                    try:
+                        req_download = urllib.request.Request(download_url, headers=headers, method="GET")
+                        with urllib.request.urlopen(req_download, timeout=20) as download_resp:
+                            download_payload = json.loads(download_resp.read().decode("utf-8"))
+                            if isinstance(download_payload, list):
+                                remote_logs = download_payload
+                    except Exception:  # noqa: BLE001
+                        remote_logs = []
     except urllib.error.HTTPError as exc:
         if exc.code != 404:
             return {"synced": False, "reason": f"GitHub GET falhou ({exc.code})"}
     except Exception as exc:  # noqa: BLE001
         return {"synced": False, "reason": f"GitHub GET erro: {exc}"}
 
-    content = base64.b64encode(json.dumps(logs, ensure_ascii=False, indent=2).encode("utf-8")).decode("utf-8")
+    merged_logs = merge_log_lists(remote_logs, logs)
+    content = base64.b64encode(json.dumps(merged_logs, ensure_ascii=False, indent=2).encode("utf-8")).decode("utf-8")
     utc_now = datetime.now(ZoneInfo("UTC")).isoformat().replace("+00:00", "Z")
     payload = {
         "message": f"Atualiza Dados.json ({utc_now})",
@@ -920,19 +1192,51 @@ def github_sync_logs(logs: list) -> dict:
             method="PUT",
         )
         with urllib.request.urlopen(req_put, timeout=30):
-            return {"synced": True, "reason": "ok"}
+            return {
+                "synced": True,
+                "reason": "ok",
+                "merged_logs": merged_logs,
+                "remote_count": len(remote_logs),
+                "sent_count": len(logs),
+                "merged_count": len(merged_logs),
+            }
     except urllib.error.HTTPError as exc:
         return {"synced": False, "reason": f"GitHub PUT falhou ({exc.code})"}
     except Exception as exc:  # noqa: BLE001
         return {"synced": False, "reason": f"GitHub PUT erro: {exc}"}
 
 
+def github_sync_logs_with_retry(logs: list) -> dict:
+    retries = max(1, int(to_number(get_env("GITHUB_SYNC_RETRIES", "3"), 3)))
+    retry_delay = max(0.0, to_number(get_env("GITHUB_SYNC_RETRY_DELAY_SECONDS", "1.0"), 1.0))
+    last_result = {"synced": False, "reason": "Sync nao executado."}
+
+    for attempt in range(1, retries + 1):
+        result = github_sync_logs(logs)
+        result["attempt"] = attempt
+        result["max_attempts"] = retries
+        if result.get("synced"):
+            return result
+        last_result = result
+        if attempt < retries and retry_delay > 0:
+            time.sleep(retry_delay)
+
+    return last_result
+
+
+def is_github_sync_required() -> bool:
+    return to_bool(get_env("GITHUB_SYNC_REQUIRED", "1"), True)
+
+
 def append_send_log(record: dict) -> dict:
     with DATA_FILE_LOCK:
-        logs = read_logs()
-        logs.append(record)
+        logs = merge_log_lists(read_logs(), [record])
         write_logs(logs)
-        github_sync = github_sync_logs(logs)
+        github_sync = github_sync_logs_with_retry(logs)
+        merged_logs = github_sync.get("merged_logs")
+        if isinstance(merged_logs, list):
+            write_logs(merged_logs)
+            github_sync.pop("merged_logs", None)
     return github_sync
 
 
@@ -995,8 +1299,194 @@ def make_log_record(
     }
 
 
+RANK_DATA_SOURCE_DEFAULT = "https://github.com/PopularAtacarejo/SuperPOP/blob/main/Dados.json"
+
+
+def normalize_name_key(name: str) -> str:
+    plain = unicodedata.normalize("NFD", name or "")
+    plain = "".join(ch for ch in plain if unicodedata.category(ch) != "Mn")
+    plain = re.sub(r"\s+", " ", plain).strip().lower()
+    return plain
+
+
+def parse_log_timestamp(record: dict) -> float:
+    if not isinstance(record, dict):
+        return 0.0
+
+    iso_value = str(record.get("data_hora_iso", "")).strip()
+    if iso_value:
+        try:
+            return datetime.fromisoformat(iso_value).timestamp()
+        except ValueError:
+            pass
+
+    dia_value = str(record.get("dia", "")).strip()
+    hora_value = str(record.get("horario", "")).strip() or "00:00:00"
+    if dia_value:
+        try:
+            return datetime.strptime(f"{dia_value} {hora_value}", "%d/%m/%Y %H:%M:%S").timestamp()
+        except ValueError:
+            pass
+
+    return 0.0
+
+
+def resolve_rank_data_source_url() -> tuple[str, str]:
+    configured = get_env("RANK_DATA_SOURCE_URL", RANK_DATA_SOURCE_DEFAULT)
+    resolved = normalize_layout_source_url(configured)
+    return configured, resolved
+
+
+def fetch_rank_logs_remote(source_url: str) -> tuple[list, str]:
+    if not source_url:
+        return [], "URL da fonte de rank nao foi configurada."
+
+    timeout_seconds = max(5.0, to_number(get_env("RANK_SOURCE_TIMEOUT_SECONDS", "20"), 20.0))
+    request_obj = urllib.request.Request(
+        source_url,
+        headers={"User-Agent": "superpop-backend-rank-fetcher", "Accept": "application/json"},
+        method="GET",
+    )
+
+    try:
+        with urllib.request.urlopen(request_obj, timeout=timeout_seconds) as response:
+            payload = response.read().decode("utf-8")
+            loaded = json.loads(payload) if payload else []
+    except urllib.error.HTTPError as exc:
+        return [], f"Falha ao ler fonte remota (HTTP {exc.code})."
+    except json.JSONDecodeError:
+        return [], "Fonte remota retornou JSON invalido."
+    except Exception as exc:  # noqa: BLE001
+        return [], f"Falha ao ler fonte remota: {exc}"
+
+    if not isinstance(loaded, list):
+        return [], "Fonte remota nao retornou uma lista de registros."
+
+    return loaded, ""
+
+
+def pick_actor_name(record: dict, actor: str) -> str:
+    if not isinstance(record, dict):
+        return ""
+
+    if actor == "recebeu":
+        destinatario = record.get("destinatario", {}) or {}
+        nome = str(destinatario.get("nome", "")).strip()
+        if nome:
+            return nome
+        return str(record.get("colaborador", "")).strip()
+
+    remetente = record.get("remetente", {}) or {}
+    nome = str(remetente.get("nome", "")).strip()
+    if nome:
+        return nome
+    return str(record.get("reconhecido_por", "")).strip()
+
+
+def build_actor_rank(logs: list, actor: str) -> list:
+    grouped: dict[str, dict] = {}
+    for record in logs:
+        if not isinstance(record, dict):
+            continue
+
+        nome = pick_actor_name(record, actor)
+        if not nome or nome == "-":
+            continue
+
+        key = normalize_name_key(nome)
+        if not key:
+            continue
+
+        opcoes = record.get("opcoes_marcadas", [])
+        total_valores = len(opcoes) if isinstance(opcoes, list) else 0
+        timestamp = parse_log_timestamp(record)
+        dia_value = str(record.get("dia", "")).strip()
+        hora_value = str(record.get("horario", "")).strip()
+
+        current = grouped.get(key)
+        if not current:
+            grouped[key] = {
+                "nome": nome,
+                "total_superpop": 1,
+                "total_valores": total_valores,
+                "ultima_data": dia_value,
+                "ultimo_horario": hora_value,
+                "_latest_ts": timestamp,
+            }
+            continue
+
+        current["total_superpop"] += 1
+        current["total_valores"] += total_valores
+        if timestamp >= current["_latest_ts"]:
+            current["_latest_ts"] = timestamp
+            current["ultima_data"] = dia_value
+            current["ultimo_horario"] = hora_value
+            current["nome"] = nome
+
+    ranking = sorted(
+        grouped.values(),
+        key=lambda item: (
+            -int(item.get("total_superpop", 0)),
+            -int(item.get("total_valores", 0)),
+            str(item.get("nome", "")).lower(),
+        ),
+    )
+
+    for index, item in enumerate(ranking, start=1):
+        item["posicao"] = index
+        item.pop("_latest_ts", None)
+
+    return ranking
+
+
+def build_rank_payload(logs: list, source_configured: str, source_resolved: str) -> dict:
+    received_rank = build_actor_rank(logs, actor="recebeu")
+    sent_rank = build_actor_rank(logs, actor="enviou")
+    total_superpop = sum(int(item.get("total_superpop", 0)) for item in received_rank)
+
+    return {
+        "ok": True,
+        "gerado_em": now_brazil().isoformat(),
+        "fonte": {
+            "url_configurada": source_configured,
+            "url_resolvida": source_resolved,
+        },
+        "resumo": {
+            "total_registros": len(logs),
+            "total_superpop": total_superpop,
+            "colaboradores_que_receberam": len(received_rank),
+            "colaboradores_que_enviaram": len(sent_rank),
+        },
+        "rankings": {
+            "mais_receberam": received_rank,
+            "mais_enviaram": sent_rank,
+        },
+    }
+
+
 app = Flask(__name__)
 CORS(app)
+
+
+@app.get("/")
+def serve_superpop_home():
+    return send_from_directory(BASE_DIR, "superpop.html")
+
+
+@app.get("/superpop.html")
+def serve_superpop_file():
+    return send_from_directory(BASE_DIR, "superpop.html")
+
+
+@app.get("/rank")
+@app.get("/rank.html")
+def serve_rank_page():
+    return send_from_directory(BASE_DIR, "rank.html")
+
+
+@app.get("/Dados.json")
+def serve_dados_file():
+    return send_from_directory(BASE_DIR, "Dados.json")
 
 
 @app.get("/health")
@@ -1007,6 +1497,68 @@ def health():
 @app.get("/media/<path:filename>")
 def serve_media(filename: str):
     return send_from_directory(CARDS_DIR, filename)
+
+
+@app.get("/api/whatsapp-webjs/status")
+def whatsapp_webjs_status():
+    api_base = get_env("WHATSAPP_WEBJS_API_URL")
+    if not api_base:
+        return jsonify({"ok": False, "enabled": False, "error": "WHATSAPP_WEBJS_API_URL nao configurado."}), 400
+
+    token = get_env("WHATSAPP_WEBJS_API_TOKEN")
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    timeout_seconds = max(5.0, to_number(get_env("WHATSAPP_WEBJS_TIMEOUT_SECONDS", "45"), 45.0))
+    status_code, payload, error = get_json_request(
+        url=f"{api_base.rstrip('/')}/session/status",
+        headers=headers,
+        timeout=timeout_seconds,
+    )
+    if status_code >= 200 and status_code < 300 and isinstance(payload, dict):
+        return jsonify({"ok": True, "enabled": True, "status": payload})
+
+    return (
+        jsonify(
+            {
+                "ok": False,
+                "enabled": True,
+                "error": (payload or {}).get("error", "") if isinstance(payload, dict) else "",
+                "detail": error,
+                "status_code": status_code,
+            }
+        ),
+        502,
+    )
+
+
+@app.get("/api/whatsapp-webjs/qr")
+def whatsapp_webjs_qr():
+    api_base = get_env("WHATSAPP_WEBJS_API_URL")
+    if not api_base:
+        return jsonify({"ok": False, "enabled": False, "error": "WHATSAPP_WEBJS_API_URL nao configurado."}), 400
+
+    token = get_env("WHATSAPP_WEBJS_API_TOKEN")
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    timeout_seconds = max(5.0, to_number(get_env("WHATSAPP_WEBJS_TIMEOUT_SECONDS", "45"), 45.0))
+    status_code, payload, error = get_json_request(
+        url=f"{api_base.rstrip('/')}/session/qr",
+        headers=headers,
+        timeout=timeout_seconds,
+    )
+    if status_code >= 200 and status_code < 300 and isinstance(payload, dict):
+        return jsonify({"ok": True, "enabled": True, "qr": payload})
+
+    return (
+        jsonify(
+            {
+                "ok": False,
+                "enabled": True,
+                "error": (payload or {}).get("error", "") if isinstance(payload, dict) else "",
+                "detail": error,
+                "status_code": status_code,
+            }
+        ),
+        502,
+    )
 
 
 @app.get("/api/cards/verify/<card_id>")
@@ -1024,6 +1576,27 @@ def verify_card(card_id: str):
             return jsonify({"ok": True, "auth_valid": True, "card_id": card_id, "registro": record})
 
     return jsonify({"ok": False, "auth_valid": False, "error": "Cartao nao encontrado nos registros."}), 404
+
+
+@app.get("/api/rank")
+def api_rank():
+    configured_source, resolved_source = resolve_rank_data_source_url()
+    logs, error = fetch_rank_logs_remote(resolved_source)
+    if error:
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": error,
+                    "fonte": {
+                        "url_configurada": configured_source,
+                        "url_resolvida": resolved_source,
+                    },
+                }
+            ),
+            502,
+        )
+    return jsonify(build_rank_payload(logs, configured_source, resolved_source))
 
 
 @app.post("/api/cards/generate")
@@ -1051,85 +1624,215 @@ def generate_card():
 @app.post("/api/logs/register")
 def register_log():
     payload = normalize_payload(request.get_json(silent=True) or {})
-    card_id = uuid.uuid4().hex[:10]
-    auth_token = build_card_auth_token(card_id)
-    auth_qr_url = build_card_auth_url(card_id, auth_token)
-    image_name = f"card-{card_id}.png"
-    image_path = CARDS_DIR / image_name
-
-    create_card_image(payload, image_path, auth_qr_text=auth_qr_url)
-
-    format_selected = "image"
-    media_url = build_media_url(app, image_name)
-    image_url = build_media_url(app, image_name)
-    pdf_url = ""
-    imgbb_result = upload_image_to_imgbb(image_path)
-    uploaded_image_url = imgbb_result["url"] if imgbb_result.get("ok") else ""
-    upload_status = "success" if uploaded_image_url else "error"
-    upload_error = imgbb_result.get("error", "")
-
-    destination = normalize_whatsapp_number(payload["to"] or payload["numero_colaborador"])
-    sender_number = normalize_whatsapp_number(payload["numero_reconhecido_por"])
-
     local_now = now_brazil()
     local_date = payload["data"] or local_now.strftime("%d/%m/%Y")
     local_time = local_now.strftime("%H:%M:%S")
     local_iso = local_now.isoformat()
+    destination = normalize_whatsapp_number(payload["to"] or payload["numero_colaborador"])
+    sender_number = normalize_whatsapp_number(payload["numero_reconhecido_por"])
+    send_day_key = build_daily_send_key(sender_number, destination, local_date)
+    send_day_reserved = False
 
-    log_record = make_log_record(
-        payload=payload,
-        card_id=card_id,
-        auth_qr_url=auth_qr_url,
-        local_date=local_date,
-        local_time=local_time,
-        local_iso=local_iso,
-        destination=destination,
-        sender_number=sender_number,
-        send_status="wa_me",
-        send_error="",
-        message_sid="",
-        format_selected=format_selected,
-        image_url=image_url,
-        pdf_url=pdf_url,
-        media_url=media_url,
-        uploaded_image_url=uploaded_image_url,
-        upload_status=upload_status,
-        upload_error=upload_error,
-    )
-    github_sync = append_send_log(log_record)
-
-    if not uploaded_image_url:
-        return (
-            jsonify(
-                {
-                    "ok": False,
-                    "card_id": card_id,
-                    "auth_qr_url": auth_qr_url,
-                    "error": upload_error or "Nao foi possivel fazer upload da imagem no ImgBB.",
-                    "image_url": image_url,
-                    "pdf_url": pdf_url,
-                    "uploaded_image_url": "",
-                    "log_saved": True,
-                    "github_sync": github_sync,
-                }
-            ),
-            400,
+    with DATA_FILE_LOCK:
+        existing_logs = read_logs()
+        duplicate_record = find_duplicate_send_same_day(
+            logs=existing_logs,
+            sender_number=sender_number,
+            destination_number=destination,
+            day_value=local_date,
         )
+        if duplicate_record:
+            duplicate_name = str((duplicate_record.get("destinatario", {}) or {}).get("nome", "")).strip() or payload.get("colaborador") or "esse colaborador"
+            duplicate_time = str(duplicate_record.get("horario", "")).strip()
+            duplicate_date = str(duplicate_record.get("dia", "")).strip() or local_date
+            duplicate_hint = f" em {duplicate_date}" + (f" às {duplicate_time}" if duplicate_time else "")
+            return (
+                jsonify(
+                    {
+                        "ok": False,
+                        "duplicate_send": True,
+                        "error": f"Você já enviou SuperPOP para {duplicate_name}{duplicate_hint}.",
+                        "duplicate": {
+                            "dia": duplicate_date,
+                            "horario": duplicate_time,
+                            "card_id": str(duplicate_record.get("card_id", "")).strip(),
+                        },
+                    }
+                ),
+                409,
+            )
 
-    return jsonify(
-        {
-            "ok": True,
-            "card_id": card_id,
-            "auth_qr_url": auth_qr_url,
-            "image_url": image_url,
-            "uploaded_image_url": uploaded_image_url,
-            "delete_image_url": imgbb_result.get("delete_url", ""),
-            "pdf_url": pdf_url,
-            "media_url": media_url,
-            "log_saved": True,
-            "github_sync": github_sync,
+        if send_day_key:
+            if send_day_key in PENDING_SEND_KEYS:
+                return (
+                    jsonify(
+                        {
+                            "ok": False,
+                            "duplicate_send": True,
+                            "error": "Você já enviou SuperPOP para essa pessoa hoje. Aguarde o envio atual finalizar.",
+                        }
+                    ),
+                    409,
+                )
+            PENDING_SEND_KEYS.add(send_day_key)
+            send_day_reserved = True
+
+    try:
+        card_id = uuid.uuid4().hex[:10]
+        auth_token = build_card_auth_token(card_id)
+        auth_qr_url = build_card_auth_url(card_id, auth_token)
+        image_name = f"card-{card_id}.png"
+        image_path = CARDS_DIR / image_name
+
+        create_card_image(payload, image_path, auth_qr_text=auth_qr_url)
+
+        format_selected = "image"
+        media_url = build_media_url(app, image_name)
+        image_url = build_media_url(app, image_name)
+        pdf_url = ""
+        imgbb_result = upload_image_to_imgbb(image_path)
+        uploaded_image_url = imgbb_result["url"] if imgbb_result.get("ok") else ""
+        upload_status = "success" if uploaded_image_url else "error"
+        upload_error = imgbb_result.get("error", "")
+        send_mode = payload.get("send_mode") or get_whatsapp_send_mode()
+        if send_mode not in {"wa_me", "webjs"}:
+            send_mode = get_whatsapp_send_mode()
+        send_status = "wa_me"
+        send_error = ""
+        message_sid = ""
+        webjs_result = {
+            "enabled": False,
+            "ok": False,
+            "error": "",
+            "message_id": "",
+            "to": destination or "",
+            "provider": "whatsapp-web.js",
         }
-    )
+
+        if send_mode == "webjs" and uploaded_image_url and destination:
+            caption = build_whatsapp_caption(payload)
+            webjs_result = send_image_via_whatsapp_webjs(
+                destination=destination,
+                image_url=uploaded_image_url,
+                caption=caption,
+            )
+            if webjs_result.get("ok"):
+                send_status = "webjs_sent"
+                message_sid = str(webjs_result.get("message_id", "")).strip()
+            else:
+                send_status = "webjs_error"
+                send_error = str(webjs_result.get("error", "")).strip()
+        elif send_mode == "webjs" and not destination:
+            send_status = "webjs_error"
+            send_error = "Numero de destino invalido para envio direto."
+
+        log_record = make_log_record(
+            payload=payload,
+            card_id=card_id,
+            auth_qr_url=auth_qr_url,
+            local_date=local_date,
+            local_time=local_time,
+            local_iso=local_iso,
+            destination=destination,
+            sender_number=sender_number,
+            send_status=send_status,
+            send_error=send_error,
+            message_sid=message_sid,
+            format_selected=format_selected,
+            image_url=image_url,
+            pdf_url=pdf_url,
+            media_url=media_url,
+            uploaded_image_url=uploaded_image_url,
+            upload_status=upload_status,
+            upload_error=upload_error,
+        )
+        github_sync = append_send_log(log_record)
+        github_synced = bool(github_sync.get("synced"))
+        github_required = is_github_sync_required()
+
+        if github_required and not github_synced:
+            return (
+                jsonify(
+                    {
+                        "ok": False,
+                        "card_id": card_id,
+                        "auth_qr_url": auth_qr_url,
+                        "error": "Falha ao sincronizar Dados.json com o GitHub. Registro nao confirmado.",
+                        "image_url": image_url,
+                        "uploaded_image_url": uploaded_image_url,
+                        "pdf_url": pdf_url,
+                        "media_url": media_url,
+                        "log_saved": False,
+                        "log_saved_local": True,
+                        "github_sync": github_sync,
+                        "delivery": {
+                            "mode": send_mode,
+                            "method": "webjs" if send_mode == "webjs" else "wa_me",
+                            "ok": send_status == "webjs_sent",
+                            "status": send_status,
+                            "error": send_error,
+                            "to": destination,
+                        },
+                        "webjs": webjs_result,
+                    }
+                ),
+                503,
+            )
+
+        if not uploaded_image_url:
+            return (
+                jsonify(
+                    {
+                        "ok": False,
+                        "card_id": card_id,
+                        "auth_qr_url": auth_qr_url,
+                        "error": upload_error or "Nao foi possivel fazer upload da imagem no ImgBB.",
+                        "image_url": image_url,
+                        "pdf_url": pdf_url,
+                        "uploaded_image_url": "",
+                        "log_saved": True,
+                        "github_sync": github_sync,
+                        "delivery": {
+                            "mode": send_mode,
+                            "method": "webjs" if send_mode == "webjs" else "wa_me",
+                            "ok": False,
+                            "status": send_status,
+                            "error": upload_error or "Nao foi possivel fazer upload da imagem no ImgBB.",
+                            "to": destination,
+                        },
+                        "webjs": webjs_result,
+                    }
+                ),
+                400,
+            )
+
+        return jsonify(
+            {
+                "ok": True,
+                "card_id": card_id,
+                "auth_qr_url": auth_qr_url,
+                "image_url": image_url,
+                "uploaded_image_url": uploaded_image_url,
+                "delete_image_url": imgbb_result.get("delete_url", ""),
+                "pdf_url": pdf_url,
+                "media_url": media_url,
+                "log_saved": True,
+                "github_sync": github_sync,
+                "delivery": {
+                    "mode": send_mode,
+                    "method": "webjs" if send_mode == "webjs" else "wa_me",
+                    "ok": send_status == "webjs_sent",
+                    "status": send_status,
+                    "error": send_error,
+                    "to": destination,
+                },
+                "webjs": webjs_result,
+            }
+        )
+    finally:
+        if send_day_reserved and send_day_key:
+            with DATA_FILE_LOCK:
+                PENDING_SEND_KEYS.discard(send_day_key)
 
 
 if __name__ == "__main__":
