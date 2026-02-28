@@ -129,6 +129,25 @@ def get_env(name: str, default: str = "") -> str:
     return value.strip() if isinstance(value, str) else value
 
 
+def normalize_cors_origin(value: str) -> str:
+    origin = str(value or "").strip()
+    if not origin:
+        return ""
+
+    # Keep wildcard/regex-style patterns compatible with flask-cors.
+    if origin == "*" or any(token in origin for token in ("*", "^", "$", "(", ")", "[", "]", "|")):
+        return origin
+
+    if "://" not in origin:
+        return origin.rstrip("/")
+
+    parsed = urllib.parse.urlsplit(origin)
+    if not parsed.scheme or not parsed.netloc:
+        return ""
+
+    return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}"
+
+
 def deep_merge_dict(base: dict, override: dict) -> dict:
     for key, value in override.items():
         if isinstance(base.get(key), dict) and isinstance(value, dict):
@@ -2024,9 +2043,13 @@ app.config["SESSION_COOKIE_SECURE"] = to_bool(
 app.config["SESSION_REFRESH_EACH_REQUEST"] = True
 cors_origins_raw = get_env(
     "CORS_ALLOWED_ORIGINS",
-    "https://superpopbackend.onrender.com,http://127.0.0.1:5500,http://localhost:5500,http://127.0.0.1:5000,http://localhost:5000",
+    "https://popularatacarejo.github.io,https://superpopbackend.onrender.com,http://127.0.0.1:5500,http://localhost:5500,http://127.0.0.1:5000,http://localhost:5000",
 )
-cors_allowed_origins = [item.strip() for item in cors_origins_raw.split(",") if item.strip()]
+cors_allowed_origins: list[str] = []
+for raw_origin in cors_origins_raw.split(","):
+    normalized_origin = normalize_cors_origin(raw_origin)
+    if normalized_origin and normalized_origin not in cors_allowed_origins:
+        cors_allowed_origins.append(normalized_origin)
 if not cors_allowed_origins:
     cors_allowed_origins = ["https://superpopbackend.onrender.com"]
 CORS(
