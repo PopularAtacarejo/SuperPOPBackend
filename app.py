@@ -181,6 +181,26 @@ def normalize_layout_source_url(url: str) -> str:
     return raw
 
 
+def get_frontend_base_url() -> str:
+    base = get_env("SUPERPOP_FRONTEND_URL", "https://popularatacarejo.github.io/SuperPOP")
+    return re.sub(r"/+$", "", str(base or "").strip())
+
+
+def build_frontend_url(path: str = "") -> str:
+    base = get_frontend_base_url()
+    clean_path = str(path or "").lstrip("/")
+    if not base:
+        return f"/{clean_path}" if clean_path else "/"
+    return f"{base}/{clean_path}" if clean_path else base
+
+
+def send_page_or_frontend(filename: str):
+    local_file = BASE_DIR / filename
+    if local_file.exists():
+        return send_from_directory(BASE_DIR, filename)
+    return redirect(build_frontend_url(filename))
+
+
 def fetch_layout_config_from_url(url: str) -> dict | None:
     source_url = normalize_layout_source_url(url)
     if not source_url:
@@ -2087,7 +2107,7 @@ def serve_superpop_file():
     blocked = require_login_redirect()
     if blocked:
         return blocked
-    return send_from_directory(BASE_DIR, "superpop.html")
+    return send_page_or_frontend("superpop.html")
 
 
 @app.get("/rank")
@@ -2096,7 +2116,7 @@ def serve_rank_page():
     blocked = require_login_redirect()
     if blocked:
         return blocked
-    return send_from_directory(BASE_DIR, "rank.html")
+    return send_page_or_frontend("rank.html")
 
 
 @app.get("/ganhadores")
@@ -2105,7 +2125,7 @@ def serve_month_winners_page():
     blocked = require_login_redirect()
     if blocked:
         return blocked
-    return send_from_directory(BASE_DIR, "ganhadores.html")
+    return send_page_or_frontend("ganhadores.html")
 
 
 @app.get("/meus-superpops")
@@ -2114,7 +2134,7 @@ def serve_my_superpops_page():
     blocked = require_login_redirect()
     if blocked:
         return blocked
-    return send_from_directory(BASE_DIR, "meus-superpops.html")
+    return send_page_or_frontend("meus-superpops.html")
 
 
 @app.get("/cadastro")
@@ -2122,7 +2142,7 @@ def serve_my_superpops_page():
 def serve_register_page():
     if is_user_logged_in():
         return redirect(url_for("serve_superpop_file"))
-    return send_from_directory(BASE_DIR, "cadastro.html")
+    return send_page_or_frontend("cadastro.html")
 
 
 @app.get("/login")
@@ -2132,7 +2152,7 @@ def serve_register_page():
 def serve_login_page():
     if is_user_logged_in():
         return redirect(url_for("serve_superpop_file"))
-    return send_from_directory(BASE_DIR, "index.html")
+    return send_page_or_frontend("index.html")
 
 
 @app.get("/acesso")
