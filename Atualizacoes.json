@@ -1,0 +1,80 @@
+[
+  {
+    "id": "seed-online-users-20260316",
+    "data_referencia": "16/03/2026",
+    "titulo": "Usuarios online no Super POP",
+    "descricao": "Adicionado menu de usuarios online em tempo quase real na tela de envio do Super POP, com lista de ativos e contador.",
+    "categoria": "Conectividade",
+    "status": "Concluido",
+    "autor": {
+      "id": "",
+      "nome": "Jeferson"
+    },
+    "created_at_iso": "2026-03-16T08:00:00-03:00"
+  },
+  {
+    "id": "seed-rank-reactions-20260316",
+    "data_referencia": "16/03/2026",
+    "titulo": "Reacoes por emoji no ranking",
+    "descricao": "Usuarios agora podem reagir no ranking com emojis, alterar a reacao e visualizar quem reagiu em cada usuario.",
+    "categoria": "Ranking",
+    "status": "Nova funcionalidade",
+    "autor": {
+      "id": "",
+      "nome": "Jeferson"
+    },
+    "created_at_iso": "2026-03-16T08:10:00-03:00"
+  },
+  {
+    "id": "seed-rank-rule-20260316",
+    "data_referencia": "16/03/2026",
+    "titulo": "Regra mensal do ranking ajustada",
+    "descricao": "No rank mensal, cada par remetente + destinatario conta apenas uma vez por mes, mesmo com varios envios.",
+    "categoria": "Regra de negocio",
+    "status": "Concluido",
+    "autor": {
+      "id": "",
+      "nome": "Jeferson"
+    },
+    "created_at_iso": "2026-03-16T08:20:00-03:00"
+  },
+  {
+    "id": "seed-duplicate-day-20260316",
+    "data_referencia": "16/03/2026",
+    "titulo": "Bloqueio de envio duplicado no mesmo dia",
+    "descricao": "Mantida a regra de 1 Super POP por dia para o mesmo destinatario, com mensagem elegante para tentativas duplicadas.",
+    "categoria": "Protecao",
+    "status": "Concluido",
+    "autor": {
+      "id": "",
+      "nome": "Jeferson"
+    },
+    "created_at_iso": "2026-03-16T08:30:00-03:00"
+  },
+  {
+    "id": "seed-register-robust-20260316",
+    "data_referencia": "16/03/2026",
+    "titulo": "Robustez no registro de Super POP",
+    "descricao": "Aplicados controles para reduzir falhas de contabilizacao e evitar concorrencia no envio.",
+    "categoria": "Confiabilidade",
+    "status": "Concluido",
+    "autor": {
+      "id": "",
+      "nome": "Jeferson"
+    },
+    "created_at_iso": "2026-03-16T08:40:00-03:00"
+  },
+  {
+    "id": "seed-destination-fix-20260316",
+    "data_referencia": "16/03/2026",
+    "titulo": "Ajuste na selecao de destinatario",
+    "descricao": "Corrigido comportamento da tela para permitir alterar o destinatario apos a primeira selecao sem travamentos.",
+    "categoria": "Usabilidade",
+    "status": "Concluido",
+    "autor": {
+      "id": "",
+      "nome": "Jeferson"
+    },
+    "created_at_iso": "2026-03-16T08:50:00-03:00"
+  }
+]

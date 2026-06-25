@@ -1,0 +1,43 @@
+{
+  "usuario": [
+    "aniversariantes",
+    "atualizacoes",
+    "dinamicas_pop",
+    "ganhadores",
+    "meus_superpops",
+    "perfil",
+    "rank",
+    "sobre",
+    "superpop"
+  ],
+  "admin": [
+    "analise",
+    "aniversariantes",
+    "atualizacoes",
+    "dinamicas_pop",
+    "ganhadores",
+    "meus_superpops",
+    "perfil",
+    "rank",
+    "sobre",
+    "superpop",
+    "usuarios"
+  ],
+  "developer": [
+    "analise",
+    "aniversariantes",
+    "atualizacoes",
+    "atualizacoes_editor",
+    "criar_usuarios",
+    "dinamicas_pop",
+    "editar_usuarios",
+    "ganhadores",
+    "meus_superpops",
+    "perfil",
+    "permissoes_paginas",
+    "rank",
+    "sobre",
+    "superpop",
+    "usuarios"
+  ]
+}
