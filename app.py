@@ -5822,6 +5822,124 @@ def _collect_today_superpop_notifications(
     return entries
 
 
+def _notification_event_is_viewed(
+    notification_id: str,
+    event_iso: object,
+    seen_ids: set[str],
+    cleared_timestamp: float | None,
+) -> bool:
+    safe_id = str(notification_id or "").strip()
+    if safe_id and safe_id in seen_ids:
+        return True
+    if cleared_timestamp is None:
+        return False
+    event_ts = _parse_iso_timestamp(event_iso)
+    return bool(event_ts is not None and event_ts <= cleared_timestamp)
+
+
+def _dynamic_notification_timestamp(entry: dict) -> float:
+    parsed = _parse_iso_timestamp(entry.get("data_hora_iso"))
+    return parsed if parsed is not None else 0.0
+
+
+def _collect_dinamicas_pop_winner_notifications(auth_user_id: str) -> list[dict]:
+    user_id = str(auth_user_id or "").strip()
+    if not user_id:
+        return []
+
+    state = get_user_notification_state(user_id)
+    seen_ids = {str(item).strip() for item in state.get("seen_ids", []) if str(item or "").strip()}
+    cleared_ts = _parse_iso_timestamp(state.get("last_cleared_iso"))
+
+    try:
+        from dinamicas_pop import DATA_LOCK as DINAMICAS_LOCK
+        from dinamicas_pop import _read_games as read_dinamicas_games
+    except Exception:
+        return []
+
+    with DINAMICAS_LOCK:
+        games = read_dinamicas_games()
+
+    entries: list[dict] = []
+    for game in games:
+        if not isinstance(game, dict):
+            continue
+        winner_prediction_id = str(game.get("palpite_ganhador_id", "")).strip()
+        if not winner_prediction_id:
+            continue
+        predictions = game.get("palpites")
+        if not isinstance(predictions, list):
+            continue
+        winner_prediction = next(
+            (
+                item
+                for item in predictions
+                if isinstance(item, dict)
+                and str(item.get("id", "")).strip() == winner_prediction_id
+                and str(item.get("usuario_id", "")).strip() == user_id
+            ),
+            None,
+        )
+        if not winner_prediction:
+            continue
+
+        selected_at = str(game.get("palpite_ganhador_selecionado_em_iso", "")).strip()
+        notification_id = "dinamica_pop:" + ":".join(
+            [
+                str(game.get("id", "")).strip(),
+                winner_prediction_id,
+                selected_at or str(game.get("updated_at_iso", "")).strip() or str(game.get("created_at_iso", "")).strip(),
+            ]
+        )
+        home_team = str(game.get("time_casa", "")).strip() or "Time da casa"
+        away_team = str(game.get("time_visitante", "")).strip() or "Time visitante"
+        home_score = str(winner_prediction.get("gols_casa", "")).strip()
+        away_score = str(winner_prediction.get("gols_visitante", "")).strip()
+        prize = str(game.get("descricao_premio", "")).strip()
+        competition = str(game.get("competicao", "")).strip() or "Dinâmicas POP"
+        match_label = f"{home_team} x {away_team}"
+        score_label = f"{home_score} x {away_score}" if home_score or away_score else ""
+        whatsapp_text = (
+            "Ganhei na Dinâmica POP! "
+            f"Meu palpite em {match_label}"
+            + (f" foi {score_label}." if score_label else ".")
+            + (f" Prêmio: {prize}." if prize else "")
+        )
+
+        entries.append(
+            {
+                "id": notification_id,
+                "tipo": "dinamica_pop_ganhador",
+                "titulo": "Você ganhou na Dinâmica POP!",
+                "mensagem": (
+                    f"Seu palpite foi selecionado como ganhador em {match_label}."
+                    + (f" Prêmio: {prize}" if prize else "")
+                ),
+                "data_hora_iso": selected_at,
+                "visualizado": _notification_event_is_viewed(notification_id, selected_at, seen_ids, cleared_ts),
+                "competicao": competition,
+                "premio": prize,
+                "regras": str(game.get("regras", "")).strip(),
+                "whatsapp_text": whatsapp_text,
+                "jogo": {
+                    "id": str(game.get("id", "")).strip(),
+                    "time_casa": home_team,
+                    "time_visitante": away_team,
+                    "data_jogo": str(game.get("data_jogo", "")).strip(),
+                    "horario_jogo": str(game.get("horario_jogo", "")).strip(),
+                },
+                "palpite": {
+                    "id": winner_prediction_id,
+                    "gols_casa": winner_prediction.get("gols_casa"),
+                    "gols_visitante": winner_prediction.get("gols_visitante"),
+                },
+            }
+        )
+
+    entries.sort(key=_dynamic_notification_timestamp, reverse=True)
+    return entries[:20]
+
+
 @app.get("/api/me/notifications/superpops")
 def api_superpop_notifications():
     auth_context = get_authenticated_user_context()
@@ -5838,6 +5956,11 @@ def api_superpop_notifications():
         auth_user_nome,
         auth_user_numero,
         today,
+    )
+    notifications.extend(_collect_dinamicas_pop_winner_notifications(auth_user_id))
+    notifications.sort(
+        key=lambda item: _dynamic_notification_timestamp(item) or parse_log_timestamp(item),
+        reverse=True,
     )
     unread = sum(1 for item in notifications if not item.get("visualizado"))
     return jsonify(

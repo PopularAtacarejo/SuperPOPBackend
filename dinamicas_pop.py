@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import threading
+import urllib.request
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -13,13 +16,61 @@ from flask import Blueprint, jsonify, request
 dinamicas_pop_bp = Blueprint("dinamicas_pop", __name__)
 
 BASE_DIR = Path(__file__).resolve().parent
-DATA_FILE = BASE_DIR / "DinamicasPOP.json"
+DATA_FILE = Path(os.getenv("DINAMICAS_POP_DATA_FILE", BASE_DIR.parent / "dinamica.json"))
+LEGACY_DATA_FILE = BASE_DIR / "DinamicasPOP.json"
 DATA_LOCK = threading.Lock()
 
 
 def _ensure_data_file() -> None:
     if not DATA_FILE.exists():
+        DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
+        if LEGACY_DATA_FILE.exists():
+            shutil.copy2(LEGACY_DATA_FILE, DATA_FILE)
+            return
         DATA_FILE.write_text("[]\n", encoding="utf-8")
+
+
+def _write_games_local(games: list[dict[str, Any]]) -> None:
+    _ensure_data_file()
+    temporary = DATA_FILE.with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps(games, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(DATA_FILE)
+
+
+def _remote_data_url() -> str:
+    configured = os.getenv("DINAMICAS_POP_SOURCE_URL", "").strip()
+    if configured:
+        return configured
+    repo = os.getenv("GITHUB_REPO", "PopularAtacarejo/SuperPOP").strip()
+    branch = os.getenv("GITHUB_BRANCH", "main").strip()
+    repo_path = os.getenv("GITHUB_DINAMICAS_FILE_PATH", "dinamica.json").strip()
+    if not repo or not branch or not repo_path:
+        return ""
+    return f"https://raw.githubusercontent.com/{repo}/{branch}/{repo_path}"
+
+
+def _read_remote_games() -> list[dict[str, Any]]:
+    if os.getenv("DINAMICAS_POP_REMOTE_READ_ENABLED", "1").strip().lower() in {"0", "false", "no", "nao"}:
+        return []
+    source_url = _remote_data_url()
+    if not source_url:
+        return []
+    try:
+        request_obj = urllib.request.Request(
+            source_url,
+            headers={"User-Agent": "superpop-dinamicas-pop"},
+            method="GET",
+        )
+        with urllib.request.urlopen(request_obj, timeout=12) as response:
+            loaded = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return []
+    if not isinstance(loaded, list):
+        return []
+    return [item for item in loaded if isinstance(item, dict)]
 
 
 def _read_games() -> list[dict[str, Any]]:
@@ -30,17 +81,32 @@ def _read_games() -> list[dict[str, Any]]:
         return []
     if not isinstance(loaded, list):
         return []
-    return [item for item in loaded if isinstance(item, dict)]
+    local_games = [item for item in loaded if isinstance(item, dict)]
+    if local_games:
+        return local_games
+    remote_games = _read_remote_games()
+    if remote_games:
+        _write_games_local(remote_games)
+        return remote_games
+    return []
 
 
-def _write_games(games: list[dict[str, Any]]) -> None:
-    _ensure_data_file()
-    temporary = DATA_FILE.with_suffix(".tmp")
-    temporary.write_text(
-        json.dumps(games, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
+def _sync_games_to_github(games: list[dict[str, Any]]) -> dict[str, Any]:
+    try:
+        from app import get_env, github_sync_json_file, github_sync_with_retry
+    except Exception as exc:  # pragma: no cover - best effort when imported outside Flask
+        return {"synced": False, "reason": f"Sync GitHub indisponivel: {exc}"}
+
+    repo_path = get_env("GITHUB_DINAMICAS_FILE_PATH", "dinamica.json")
+    return github_sync_with_retry(
+        games,
+        lambda records: github_sync_json_file(records, repo_path),
     )
-    temporary.replace(DATA_FILE)
+
+
+def _write_games(games: list[dict[str, Any]]) -> dict[str, Any]:
+    _write_games_local(games)
+    return _sync_games_to_github(games)
 
 
 def _auth_context() -> dict[str, Any] | None:
@@ -62,6 +128,12 @@ def _is_developer(context: dict[str, Any]) -> bool:
 
 def _clean_text(value: object, maximum: int = 80) -> str:
     return " ".join(str(value or "").strip().split())[:maximum]
+
+
+def _clean_multiline_text(value: object, maximum: int = 700) -> str:
+    text = str(value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    lines = [" ".join(line.strip().split()) for line in text.split("\n")]
+    return "\n".join(line for line in lines if line)[:maximum]
 
 
 def _clean_image_url(value: object) -> tuple[str, str]:
@@ -110,10 +182,87 @@ def _parse_score(value: object) -> int | None:
     return parsed if 0 <= parsed <= 99 else None
 
 
+def _score_outcome(home_score: int, away_score: int) -> str:
+    if home_score > away_score:
+        return "casa"
+    if away_score > home_score:
+        return "visitante"
+    return "empate"
+
+
+def _result_scores(game: dict[str, Any]) -> tuple[int | None, int | None]:
+    result = game.get("resultado")
+    if not isinstance(result, dict):
+        return None, None
+    return _parse_score(result.get("gols_casa")), _parse_score(result.get("gols_visitante"))
+
+
+def _prediction_snapshot(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": str(item.get("id", "")),
+        "usuario_id": str(item.get("usuario_id", "")),
+        "usuario_nome": str(item.get("usuario_nome", "")),
+        "usuario_foto": str(item.get("usuario_foto", "")),
+        "usuario_funcao": str(item.get("usuario_funcao", "")),
+        "gols_casa": item.get("gols_casa"),
+        "gols_visitante": item.get("gols_visitante"),
+        "enviado_em_iso": str(item.get("enviado_em_iso", "")),
+        "alterado_em_iso": str(item.get("alterado_em_iso", "")),
+    }
+
+
+def _selected_winner_id(game: dict[str, Any]) -> str:
+    return str(game.get("palpite_ganhador_id", "")).strip()
+
+
+def _find_prediction_by_id(game: dict[str, Any], prediction_id: str) -> dict[str, Any] | None:
+    wanted = str(prediction_id or "").strip()
+    predictions = game.get("palpites")
+    if not isinstance(predictions, list):
+        return None
+    for item in predictions:
+        if isinstance(item, dict) and str(item.get("id", "")).strip() == wanted:
+            return item
+    return None
+
+
+def _recalculate_game_winners(game: dict[str, Any]) -> None:
+    home_result, away_result = _result_scores(game)
+    if home_result is None or away_result is None:
+        game["ganhadores"] = []
+        game["acertos_resultado"] = []
+        return
+
+    result_outcome = _score_outcome(home_result, away_result)
+    predictions = game.get("palpites")
+    if not isinstance(predictions, list):
+        predictions = []
+
+    exact_winners: list[dict[str, Any]] = []
+    outcome_hits: list[dict[str, Any]] = []
+    for item in predictions:
+        if not isinstance(item, dict):
+            continue
+        home_prediction = _parse_score(item.get("gols_casa"))
+        away_prediction = _parse_score(item.get("gols_visitante"))
+        if home_prediction is None or away_prediction is None:
+            continue
+        snapshot = _prediction_snapshot(item)
+        if home_prediction == home_result and away_prediction == away_result:
+            exact_winners.append(snapshot)
+        if _score_outcome(home_prediction, away_prediction) == result_outcome:
+            outcome_hits.append(snapshot)
+
+    game["ganhadores"] = exact_winners
+    game["acertos_resultado"] = outcome_hits
+
+
 def _normalize_game_payload(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
     home_team = _clean_text(payload.get("time_casa"))
     away_team = _clean_text(payload.get("time_visitante"))
     competition = _clean_text(payload.get("competicao"), 100)
+    prize_description = _clean_multiline_text(payload.get("descricao_premio"), 500)
+    rules = _clean_multiline_text(payload.get("regras"), 900)
     home_image, home_image_error = _clean_image_url(payload.get("imagem_time_casa"))
     away_image, away_image_error = _clean_image_url(payload.get("imagem_time_visitante"))
     match_datetime, datetime_error = _parse_match_datetime(
@@ -159,6 +308,8 @@ def _normalize_game_payload(payload: dict[str, Any]) -> tuple[dict[str, Any] | N
         "imagem_time_casa": home_image,
         "imagem_time_visitante": away_image,
         "competicao": competition,
+        "descricao_premio": prize_description,
+        "regras": rules,
         "data_jogo": match_datetime.strftime("%Y-%m-%d"),
         "horario_jogo": match_datetime.strftime("%H:%M"),
         "inicio_iso": match_datetime.isoformat(),
@@ -199,11 +350,17 @@ def _prediction_status(game: dict[str, Any]) -> str:
     return "aberto"
 
 
-def _public_prediction(item: dict[str, Any]) -> dict[str, Any]:
+def _public_prediction(item: dict[str, Any], employees_map: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    user_id = str(item.get("usuario_id", ""))
+    employee = employees_map.get(user_id) or {}
+    user_photo = str(employee.get("foto_perfil_data_url", "") or item.get("usuario_foto", ""))
+    user_role = str(employee.get("funcao", "") or item.get("usuario_funcao", ""))
     return {
         "id": str(item.get("id", "")),
-        "usuario_id": str(item.get("usuario_id", "")),
+        "usuario_id": user_id,
         "usuario_nome": str(item.get("usuario_nome", "")),
+        "usuario_foto": user_photo,
+        "usuario_funcao": user_role,
         "gols_casa": item.get("gols_casa"),
         "gols_visitante": item.get("gols_visitante"),
         "enviado_em_iso": str(item.get("enviado_em_iso", "")),
@@ -211,7 +368,63 @@ def _public_prediction(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _public_game(game: dict[str, Any], user_id: str, developer: bool) -> dict[str, Any]:
+def _public_selected_winner(game: dict[str, Any], employees_map: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+    selected = _find_prediction_by_id(game, _selected_winner_id(game))
+    if not selected:
+        return None
+    public = _public_prediction(selected, employees_map)
+    public["selecionado_em_iso"] = str(game.get("palpite_ganhador_selecionado_em_iso", ""))
+    selected_by = game.get("palpite_ganhador_selecionado_por")
+    public["selecionado_por"] = selected_by if isinstance(selected_by, dict) else {}
+    return public
+
+
+def _public_result(game: dict[str, Any], employees_map: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    result = game.get("resultado")
+    selected_winner = _public_selected_winner(game, employees_map)
+    if not isinstance(result, dict):
+        return {
+            "definido": False,
+            "gols_casa": None,
+            "gols_visitante": None,
+            "definido_em_iso": "",
+            "definido_por": {},
+            "ganhadores": [],
+            "acertos_resultado": [],
+            "total_ganhadores": 0,
+            "total_acertos_resultado": 0,
+            "ganhador_selecionado": selected_winner,
+        }
+
+    winners = game.get("ganhadores")
+    if not isinstance(winners, list):
+        winners = []
+    outcome_hits = game.get("acertos_resultado")
+    if not isinstance(outcome_hits, list):
+        outcome_hits = []
+
+    return {
+        "definido": True,
+        "gols_casa": result.get("gols_casa"),
+        "gols_visitante": result.get("gols_visitante"),
+        "definido_em_iso": str(result.get("definido_em_iso", "")),
+        "definido_por": result.get("definido_por") if isinstance(result.get("definido_por"), dict) else {},
+        "ganhadores": [
+            _public_prediction(item, employees_map) for item in winners if isinstance(item, dict)
+        ],
+        "acertos_resultado": [
+            _public_prediction(item, employees_map) for item in outcome_hits if isinstance(item, dict)
+        ],
+        "total_ganhadores": len([item for item in winners if isinstance(item, dict)]),
+        "total_acertos_resultado": len([item for item in outcome_hits if isinstance(item, dict)]),
+        "ganhador_selecionado": selected_winner,
+    }
+
+
+def _public_game(game: dict[str, Any], user_id: str, developer: bool, employees_map: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
+    if employees_map is None:
+        from app import read_employees
+        employees_map = {str(emp.get("id", "")): emp for emp in read_employees() if isinstance(emp, dict)}
     predictions = game.get("palpites")
     if not isinstance(predictions, list):
         predictions = []
@@ -226,6 +439,7 @@ def _public_game(game: dict[str, Any], user_id: str, developer: bool) -> dict[st
     )
     prediction_start, prediction_end = _prediction_period(game)
     prediction_status = _prediction_status(game)
+    selected_winner_id = _selected_winner_id(game)
     public = {
         "id": str(game.get("id", "")),
         "time_casa": str(game.get("time_casa", "")),
@@ -233,6 +447,8 @@ def _public_game(game: dict[str, Any], user_id: str, developer: bool) -> dict[st
         "imagem_time_casa": str(game.get("imagem_time_casa", "")),
         "imagem_time_visitante": str(game.get("imagem_time_visitante", "")),
         "competicao": str(game.get("competicao", "")),
+        "descricao_premio": str(game.get("descricao_premio", "")),
+        "regras": str(game.get("regras", "")),
         "data_jogo": str(game.get("data_jogo", "")),
         "horario_jogo": str(game.get("horario_jogo", "")),
         "inicio_iso": str(game.get("inicio_iso", "")),
@@ -244,13 +460,23 @@ def _public_game(game: dict[str, Any], user_id: str, developer: bool) -> dict[st
         "total_palpites": len(predictions),
         "meu_palpite": own_prediction,
         "ja_enviou_palpite": bool(own_prediction),
+        "palpite_ganhador_id": selected_winner_id,
+        "resultado": _public_result(game, employees_map),
         "palpites_enviados": [
-            _public_prediction(item) for item in predictions if isinstance(item, dict)
+            {
+                **_public_prediction(item, employees_map),
+                "ganhador_selecionado": str(item.get("id", "")) == selected_winner_id,
+            }
+            for item in predictions if isinstance(item, dict)
         ],
     }
     if developer:
         public["palpites"] = [
-            _public_prediction(item) for item in predictions if isinstance(item, dict)
+            {
+                **_public_prediction(item, employees_map),
+                "ganhador_selecionado": str(item.get("id", "")) == selected_winner_id,
+            }
+            for item in predictions if isinstance(item, dict)
         ]
     return public
 
@@ -268,11 +494,15 @@ def list_games():
         games = _read_games()
 
     games.sort(key=lambda item: str(item.get("inicio_iso", "")))
+    
+    from app import read_employees
+    employees_map = {str(emp.get("id", "")): emp for emp in read_employees() if isinstance(emp, dict)}
+    
     return jsonify(
         {
             "ok": True,
             "is_developer": developer,
-            "jogos": [_public_game(game, user_id, developer) for game in games],
+            "jogos": [_public_game(game, user_id, developer, employees_map) for game in games],
         }
     )
 
@@ -303,9 +533,9 @@ def create_game():
     with DATA_LOCK:
         games = _read_games()
         games.append(game)
-        _write_games(games)
+        github_sync = _write_games(games)
 
-    return jsonify({"ok": True, "jogo": _public_game(game, str(user.get("id", "")), True)}), 201
+    return jsonify({"ok": True, "jogo": _public_game(game, str(user.get("id", "")), True), "github_sync": github_sync}), 201
 
 
 @dinamicas_pop_bp.put("/api/dinamicas-pop/jogos/<game_id>")
@@ -328,10 +558,10 @@ def update_game(game_id: str):
         game.update(normalized)
         game["updated_at_iso"] = _now().isoformat()
         games[index] = game
-        _write_games(games)
+        github_sync = _write_games(games)
 
     user_id = str((context.get("usuario") or {}).get("id", ""))
-    return jsonify({"ok": True, "jogo": _public_game(game, user_id, True)})
+    return jsonify({"ok": True, "jogo": _public_game(game, user_id, True), "github_sync": github_sync})
 
 
 @dinamicas_pop_bp.delete("/api/dinamicas-pop/jogos/<game_id>")
@@ -348,8 +578,8 @@ def delete_game(game_id: str):
         if not game:
             return jsonify({"ok": False, "error": "Jogo nao encontrado."}), 404
         games.pop(index)
-        _write_games(games)
-    return jsonify({"ok": True})
+        github_sync = _write_games(games)
+    return jsonify({"ok": True, "github_sync": github_sync})
 
 
 @dinamicas_pop_bp.post("/api/dinamicas-pop/jogos/<game_id>/palpite")
@@ -400,16 +630,88 @@ def save_prediction(game_id: str):
             "id": uuid.uuid4().hex,
             "usuario_id": user_id,
             "usuario_nome": str(user.get("nome", "")).strip(),
+            "usuario_foto": str(user.get("foto_perfil_data_url", "")).strip(),
+            "usuario_funcao": str(user.get("funcao", "")).strip(),
             "gols_casa": home_score,
             "gols_visitante": away_score,
             "enviado_em_iso": _now().isoformat(),
         }
         predictions.append(prediction)
         game["palpites"] = predictions
+        _recalculate_game_winners(game)
         games[index] = game
-        _write_games(games)
+        github_sync = _write_games(games)
 
-    return jsonify({"ok": True, "palpite": prediction})
+    return jsonify({"ok": True, "palpite": prediction, "github_sync": github_sync})
+
+
+@dinamicas_pop_bp.put("/api/dinamicas-pop/jogos/<game_id>/resultado")
+def save_result(game_id: str):
+    context = _auth_context()
+    if not context:
+        return jsonify({"ok": False, "error": "Nao autenticado."}), 401
+    if not _is_developer(context):
+        return jsonify({"ok": False, "error": "Apenas desenvolvedores podem informar o resultado."}), 403
+
+    payload = request.get_json(silent=True) or {}
+    home_score = _parse_score(payload.get("gols_casa"))
+    away_score = _parse_score(payload.get("gols_visitante"))
+    if home_score is None or away_score is None:
+        return jsonify({"ok": False, "error": "Informe o placar final entre 0 e 99."}), 400
+
+    user = context.get("usuario") or {}
+    user_id = str(user.get("id", "")).strip()
+    with DATA_LOCK:
+        games = _read_games()
+        game_index, game = _find_game(games, game_id)
+        if not game:
+            return jsonify({"ok": False, "error": "Jogo nao encontrado."}), 404
+
+        game["resultado"] = {
+            "gols_casa": home_score,
+            "gols_visitante": away_score,
+            "definido_em_iso": _now().isoformat(),
+            "definido_por": {
+                "id": user_id,
+                "nome": str(user.get("nome", "")).strip(),
+            },
+        }
+        _recalculate_game_winners(game)
+        games[game_index] = game
+        github_sync = _write_games(games)
+
+    return jsonify({"ok": True, "jogo": _public_game(game, user_id, True), "github_sync": github_sync})
+
+
+@dinamicas_pop_bp.put("/api/dinamicas-pop/jogos/<game_id>/ganhador/<prediction_id>")
+def select_prediction_winner(game_id: str, prediction_id: str):
+    context = _auth_context()
+    if not context:
+        return jsonify({"ok": False, "error": "Nao autenticado."}), 401
+    if not _is_developer(context):
+        return jsonify({"ok": False, "error": "Apenas desenvolvedores podem selecionar o ganhador."}), 403
+
+    user = context.get("usuario") or {}
+    user_id = str(user.get("id", "")).strip()
+    with DATA_LOCK:
+        games = _read_games()
+        game_index, game = _find_game(games, game_id)
+        if not game:
+            return jsonify({"ok": False, "error": "Jogo nao encontrado."}), 404
+        prediction = _find_prediction_by_id(game, prediction_id)
+        if not prediction:
+            return jsonify({"ok": False, "error": "Palpite nao encontrado."}), 404
+
+        game["palpite_ganhador_id"] = str(prediction.get("id", "")).strip()
+        game["palpite_ganhador_selecionado_em_iso"] = _now().isoformat()
+        game["palpite_ganhador_selecionado_por"] = {
+            "id": user_id,
+            "nome": str(user.get("nome", "")).strip(),
+        }
+        games[game_index] = game
+        github_sync = _write_games(games)
+
+    return jsonify({"ok": True, "jogo": _public_game(game, user_id, True), "github_sync": github_sync})
 
 
 @dinamicas_pop_bp.put("/api/dinamicas-pop/jogos/<game_id>/palpites/<prediction_id>")
@@ -450,9 +752,10 @@ def update_prediction(game_id: str, prediction_id: str):
         prediction["alterado_em_iso"] = _now().isoformat()
         predictions[prediction_index] = prediction
         game["palpites"] = predictions
+        _recalculate_game_winners(game)
         games[game_index] = game
-        _write_games(games)
-    return jsonify({"ok": True, "palpite": prediction})
+        github_sync = _write_games(games)
+    return jsonify({"ok": True, "palpite": prediction, "github_sync": github_sync})
 
 
 @dinamicas_pop_bp.delete("/api/dinamicas-pop/jogos/<game_id>/palpites/<prediction_id>")
@@ -479,6 +782,11 @@ def delete_prediction(game_id: str, prediction_id: str):
         if len(remaining) == len(predictions):
             return jsonify({"ok": False, "error": "Palpite nao encontrado."}), 404
         game["palpites"] = remaining
+        if _selected_winner_id(game) == str(prediction_id):
+            game.pop("palpite_ganhador_id", None)
+            game.pop("palpite_ganhador_selecionado_em_iso", None)
+            game.pop("palpite_ganhador_selecionado_por", None)
+        _recalculate_game_winners(game)
         games[game_index] = game
-        _write_games(games)
-    return jsonify({"ok": True})
+        github_sync = _write_games(games)
+    return jsonify({"ok": True, "github_sync": github_sync})
