@@ -424,7 +424,7 @@ def _public_result(game: dict[str, Any], employees_map: dict[str, dict[str, Any]
 def _public_game(game: dict[str, Any], user_id: str, developer: bool, employees_map: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
     if employees_map is None:
         from app import read_employees
-        employees_map = {str(emp.get("id", "")): emp for emp in read_employees() if isinstance(emp, dict)}
+        employees_map = {str(emp.get("id", "")).strip(): emp for emp in read_employees() if isinstance(emp, dict)}
     predictions = game.get("palpites")
     if not isinstance(predictions, list):
         predictions = []
@@ -496,7 +496,7 @@ def list_games():
     games.sort(key=lambda item: str(item.get("inicio_iso", "")))
     
     from app import read_employees
-    employees_map = {str(emp.get("id", "")): emp for emp in read_employees() if isinstance(emp, dict)}
+    employees_map = {str(emp.get("id", "")).strip(): emp for emp in read_employees() if isinstance(emp, dict)}
     
     return jsonify(
         {
