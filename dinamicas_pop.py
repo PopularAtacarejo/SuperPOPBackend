@@ -226,6 +226,41 @@ def _find_prediction_by_id(game: dict[str, Any], prediction_id: str) -> dict[str
     return None
 
 
+def _find_prediction_index_for_delete(
+    predictions: list[Any],
+    prediction_id: str,
+    query_args: Any,
+) -> int:
+    wanted = str(prediction_id or "").strip()
+    if wanted and wanted != "legacy":
+        for index, item in enumerate(predictions):
+            if isinstance(item, dict) and str(item.get("id", "")).strip() == wanted:
+                return index
+
+    wanted_user_id = str(query_args.get("usuario_id", "")).strip()
+    wanted_sent_at = str(query_args.get("enviado_em_iso", "")).strip()
+    wanted_home_score = _parse_score(query_args.get("gols_casa"))
+    wanted_away_score = _parse_score(query_args.get("gols_visitante"))
+    if not any([wanted_user_id, wanted_sent_at, wanted_home_score is not None, wanted_away_score is not None]):
+        return -1
+
+    candidates: list[int] = []
+    for index, item in enumerate(predictions):
+        if not isinstance(item, dict):
+            continue
+        if wanted_user_id and str(item.get("usuario_id", "")).strip() != wanted_user_id:
+            continue
+        if wanted_sent_at and str(item.get("enviado_em_iso", "")).strip() != wanted_sent_at:
+            continue
+        if wanted_home_score is not None and _parse_score(item.get("gols_casa")) != wanted_home_score:
+            continue
+        if wanted_away_score is not None and _parse_score(item.get("gols_visitante")) != wanted_away_score:
+            continue
+        candidates.append(index)
+
+    return candidates[0] if len(candidates) == 1 else -1
+
+
 def _recalculate_game_winners(game: dict[str, Any]) -> None:
     home_result, away_result = _result_scores(game)
     if home_result is None or away_result is None:
@@ -774,15 +809,18 @@ def delete_prediction(game_id: str, prediction_id: str):
         predictions = game.get("palpites")
         if not isinstance(predictions, list):
             predictions = []
-        remaining = [
-            item
-            for item in predictions
-            if not (isinstance(item, dict) and str(item.get("id", "")) == str(prediction_id))
-        ]
-        if len(remaining) == len(predictions):
+        prediction_index = _find_prediction_index_for_delete(predictions, prediction_id, request.args)
+        if prediction_index < 0:
             return jsonify({"ok": False, "error": "Palpite nao encontrado."}), 404
+        deleted_prediction = predictions.pop(prediction_index)
+        remaining = predictions
         game["palpites"] = remaining
-        if _selected_winner_id(game) == str(prediction_id):
+        deleted_prediction_id = (
+            str(deleted_prediction.get("id", "")).strip()
+            if isinstance(deleted_prediction, dict)
+            else str(prediction_id).strip()
+        )
+        if deleted_prediction_id and _selected_winner_id(game) == deleted_prediction_id:
             game.pop("palpite_ganhador_id", None)
             game.pop("palpite_ganhador_selecionado_em_iso", None)
             game.pop("palpite_ganhador_selecionado_por", None)
