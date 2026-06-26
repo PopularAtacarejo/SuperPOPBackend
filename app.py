@@ -3832,6 +3832,13 @@ def refresh_local_employees_from_remote(existing_records: list) -> tuple[list, s
     return merged_records, ""
 
 
+def load_employee_records_for_write_validation(existing_records: list) -> tuple[list, str]:
+    records, error = refresh_local_employees_from_remote(existing_records)
+    if error and is_github_sync_required():
+        return records, "Nao foi possivel validar a base de usuarios no GitHub. Tente novamente em instantes."
+    return records, ""
+
+
 def pick_actor_name(record: dict, actor: str) -> str:
     if not isinstance(record, dict):
         return ""
@@ -5370,6 +5377,9 @@ def api_dev_create_user():
                 "Falha ao criar backup de funcionarios antes do cadastro dev: %s", exc
             )
         existing_records = read_employees()
+        existing_records, source_error = load_employee_records_for_write_validation(existing_records)
+        if source_error:
+            return jsonify({"ok": False, "error": source_error}), 503
         duplicated, duplicate_error = find_duplicate_employee(
             existing_records,
             phone_digits,
@@ -5454,6 +5464,20 @@ def api_dev_update_user(employee_id: str):
         return jsonify({"ok": False, "error": "Nao foi possivel atualizar o usuario."}), 500
 
     public_employee = build_employee_public_record(updated_employee)
+    if is_github_sync_required() and not github_sync.get("synced"):
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": "Usuario atualizado localmente, mas nao foi possivel sincronizar Funcioinarios.json com o GitHub. A alteracao ainda pode nao aparecer na base principal.",
+                    "saved_local": True,
+                    "github_sync": github_sync,
+                    "usuario": public_employee,
+                }
+            ),
+            503,
+        )
+
     response_payload = {
         "ok": True,
         "usuario": {
@@ -5494,6 +5518,20 @@ def api_dev_delete_user(employee_id: str):
         return jsonify({"ok": False, "error": "Nao foi possivel excluir o usuario."}), 500
 
     public_employee = build_employee_public_record(deleted_employee)
+    if is_github_sync_required() and not github_sync.get("synced"):
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": "Usuario excluido localmente, mas nao foi possivel sincronizar Funcioinarios.json com o GitHub. Como o GitHub e a base principal, esse usuario ainda pode bloquear um novo cadastro.",
+                    "saved_local": True,
+                    "github_sync": github_sync,
+                    "usuario_excluido": public_employee,
+                }
+            ),
+            503,
+        )
+
     response_payload = {
         "ok": True,
         "usuario_excluido": {
@@ -6137,6 +6175,9 @@ def register_employee():
                 "Falha ao criar backup de funcionarios antes do cadastro: %s", exc
             )
         existing_records = read_employees()
+        existing_records, source_error = load_employee_records_for_write_validation(existing_records)
+        if source_error:
+            return jsonify({"ok": False, "error": source_error}), 503
         pre_cadastro_candidate = find_employee_by_phone(existing_records, phone_digits)
         if isinstance(pre_cadastro_candidate, dict) and pre_cadastro_candidate.get("pre_cadastro"):
             pre_cadastro_id = str(pre_cadastro_candidate.get("id", "")).strip()
