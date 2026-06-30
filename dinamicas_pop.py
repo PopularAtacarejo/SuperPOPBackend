@@ -7,6 +7,8 @@ import threading
 import urllib.request
 import uuid
 from datetime import datetime
+from email.message import EmailMessage
+from html import escape
 from pathlib import Path
 from typing import Any
 
@@ -188,6 +190,119 @@ def _score_outcome(home_score: int, away_score: int) -> str:
     if away_score > home_score:
         return "visitante"
     return "empate"
+
+
+def _format_match_datetime_for_email(game: dict[str, Any]) -> str:
+    iso_value = str(game.get("inicio_iso", "")).strip()
+    if iso_value:
+        try:
+            return datetime.fromisoformat(iso_value).strftime("%d/%m/%Y as %H:%M")
+        except ValueError:
+            pass
+
+    date_value = str(game.get("data_jogo", "")).strip()
+    time_value = str(game.get("horario_jogo", "")).strip()
+    if date_value and time_value:
+        return f"{date_value} as {time_value}"
+    return date_value or time_value
+
+
+def _html_paragraph(value: str) -> str:
+    cleaned = str(value or "").strip()
+    if not cleaned:
+        return ""
+    return escape(cleaned).replace("\n", "<br>")
+
+
+def _send_prediction_winner_email(game: dict[str, Any], prediction: dict[str, Any]) -> dict[str, Any]:
+    winner_user_id = str(prediction.get("usuario_id", "")).strip()
+    if not winner_user_id:
+        return {"sent": False, "reason": "Palpite sem usuario vinculado."}
+
+    try:
+        from app import get_smtp_settings, mask_email_for_log, read_employees, send_email_with_fallback
+    except Exception as exc:
+        return {"sent": False, "reason": f"Envio de email indisponivel: {exc}"}
+
+    employees = read_employees()
+    employee = next(
+        (
+            item for item in employees
+            if isinstance(item, dict) and str(item.get("id", "")).strip() == winner_user_id
+        ),
+        {},
+    )
+    winner_name = str(employee.get("nome", "") or prediction.get("usuario_nome", "")).strip() or "colaborador"
+    recipient_email = str(employee.get("email", "")).strip().lower()
+    if not recipient_email:
+        return {"sent": False, "reason": "Ganhador sem email cadastrado."}
+
+    smtp = get_smtp_settings()
+    from_email = str(smtp.get("from_email", "")).strip()
+    if not from_email:
+        return {"sent": False, "reason": "Email remetente nao configurado."}
+
+    home_team = str(game.get("time_casa", "")).strip() or "Time da casa"
+    away_team = str(game.get("time_visitante", "")).strip() or "Time visitante"
+    match_label = f"{home_team} x {away_team}"
+    match_datetime = _format_match_datetime_for_email(game)
+    competition = str(game.get("competicao", "")).strip() or "Dinamica POP"
+    prize = str(game.get("descricao_premio", "")).strip()
+    rules = str(game.get("regras", "")).strip()
+    home_score = str(prediction.get("gols_casa", "")).strip()
+    away_score = str(prediction.get("gols_visitante", "")).strip()
+    score_label = f"{home_score} x {away_score}" if home_score or away_score else ""
+
+    message = EmailMessage()
+    from_name = str(smtp.get("from_name", "") or "SuperPop").strip()
+    message["Subject"] = "Voce ganhou na Dinamica POP!"
+    message["From"] = f"{from_name} <{from_email}>" if from_name else from_email
+    message["To"] = recipient_email
+
+    text_lines = [
+        f"Ola, {winner_name}.",
+        "",
+        f"Seu palpite foi selecionado como ganhador na {competition}.",
+        f"Jogo: {match_label}",
+    ]
+    if match_datetime:
+        text_lines.append(f"Data do jogo: {match_datetime}")
+    if score_label:
+        text_lines.append(f"Seu palpite: {score_label}")
+    if prize:
+        text_lines.extend(["", f"Premio: {prize}"])
+    if rules:
+        text_lines.extend(["", f"Regras: {rules}"])
+    text_lines.extend(["", "Parabens!", "Equipe SuperPop"])
+    text_content = "\n".join(text_lines)
+
+    html_parts = [
+        "<!DOCTYPE html><html><body style=\"font-family:Arial,sans-serif;color:#0f172a;line-height:1.5\">",
+        f"<p>Ola, <strong>{escape(winner_name)}</strong>.</p>",
+        f"<p>Seu palpite foi selecionado como ganhador na <strong>{escape(competition)}</strong>.</p>",
+        "<div style=\"padding:14px 16px;border:1px solid #e2e8f0;border-radius:12px;background:#f8fafc\">",
+        f"<p style=\"margin:0 0 8px\"><strong>Jogo:</strong> {escape(match_label)}</p>",
+    ]
+    if match_datetime:
+        html_parts.append(f"<p style=\"margin:0 0 8px\"><strong>Data do jogo:</strong> {escape(match_datetime)}</p>")
+    if score_label:
+        html_parts.append(f"<p style=\"margin:0\"><strong>Seu palpite:</strong> {escape(score_label)}</p>")
+    html_parts.append("</div>")
+    if prize:
+        html_parts.append(f"<p><strong>Premio:</strong><br>{_html_paragraph(prize)}</p>")
+    if rules:
+        html_parts.append(f"<p><strong>Regras:</strong><br>{_html_paragraph(rules)}</p>")
+    html_parts.append("<p>Parabens!<br>Equipe SuperPop</p></body></html>")
+    html_content = "".join(html_parts)
+
+    message.set_content(text_content)
+    message.add_alternative(html_content, subtype="html")
+    sent, status = send_email_with_fallback(message, html_content, text_content)
+    return {
+        "sent": sent,
+        "status": status,
+        "to": mask_email_for_log(recipient_email),
+    }
 
 
 def _result_scores(game: dict[str, Any]) -> tuple[int | None, int | None]:
@@ -745,8 +860,19 @@ def select_prediction_winner(game_id: str, prediction_id: str):
         }
         games[game_index] = game
         github_sync = _write_games(games)
+        email_game = dict(game)
+        email_prediction = dict(prediction)
 
-    return jsonify({"ok": True, "jogo": _public_game(game, user_id, True), "github_sync": github_sync})
+    winner_email = _send_prediction_winner_email(email_game, email_prediction)
+
+    return jsonify(
+        {
+            "ok": True,
+            "jogo": _public_game(game, user_id, True),
+            "github_sync": github_sync,
+            "winner_email": winner_email,
+        }
+    )
 
 
 @dinamicas_pop_bp.put("/api/dinamicas-pop/jogos/<game_id>/palpites/<prediction_id>")
