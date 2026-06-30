@@ -3249,6 +3249,29 @@ def send_email_via_microsoft_oauth(message: EmailMessage) -> tuple[bool, str]:
     return True, "ok"
 
 
+def send_email_with_fallback(message: EmailMessage, html_content: str, text_content: str) -> tuple[bool, str]:
+    delivery_attempts = []
+
+    if is_brevo_api_configured():
+        delivery_attempts.append(("brevo_api", lambda: send_email_via_brevo_api(message, html_content, text_content)))
+
+    if is_microsoft_oauth_ready():
+        delivery_attempts.append(("microsoft_oauth", lambda: send_email_via_microsoft_oauth(message)))
+
+    delivery_attempts.append(("basic_smtp", lambda: send_email_via_basic_smtp(message)))
+
+    errors: list[str] = []
+    for provider_name, attempt in delivery_attempts:
+        sent, provider_status = attempt()
+        if sent:
+            if errors:
+                return True, f"{provider_name} ok after fallback ({provider_status})"
+            return True, provider_status
+        errors.append(f"{provider_name}: {provider_status}")
+
+    return False, " | ".join(errors)
+
+
 def send_password_reset_email(employee: dict, reset_url: str) -> tuple[bool, str]:
     smtp = get_smtp_settings()
     if not is_smtp_configured():
@@ -3289,26 +3312,7 @@ def send_password_reset_email(employee: dict, reset_url: str) -> tuple[bool, str
     message.set_content(text_content)
     message.add_alternative(html_content, subtype="html")
 
-    delivery_attempts = []
-
-    if is_brevo_api_configured():
-        delivery_attempts.append(("brevo_api", lambda: send_email_via_brevo_api(message, html_content, text_content)))
-
-    if is_microsoft_oauth_ready():
-        delivery_attempts.append(("microsoft_oauth", lambda: send_email_via_microsoft_oauth(message)))
-
-    delivery_attempts.append(("basic_smtp", lambda: send_email_via_basic_smtp(message)))
-
-    errors: list[str] = []
-    for provider_name, attempt in delivery_attempts:
-        sent, provider_status = attempt()
-        if sent:
-            if errors:
-                return True, f"{provider_name} ok after fallback ({provider_status})"
-            return True, provider_status
-        errors.append(f"{provider_name}: {provider_status}")
-
-    return False, " | ".join(errors)
+    return send_email_with_fallback(message, html_content, text_content)
 
 
 def build_employee_record(payload: dict, created_iso: str) -> dict:
