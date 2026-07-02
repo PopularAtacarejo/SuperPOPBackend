@@ -9,6 +9,8 @@ import urllib.request
 import urllib.parse
 import uuid
 from datetime import datetime
+from email.message import EmailMessage
+from html import escape
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -23,11 +25,25 @@ DATA_FILE = Path(os.getenv("PRIMEIRO_GOL_DATA_FILE", BASE_DIR.parent / "primeiro
 LEGACY_DATA_FILE = BASE_DIR / "PrimeiroGol.json"
 DATA_LOCK = threading.Lock()
 
-EMPTY_STATE = {"jogadores": [], "palpites": [], "inicio_palpites_iso": "", "fim_palpites_iso": ""}
+EMPTY_STATE = {
+    "jogadores": [],
+    "palpites": [],
+    "inicio_palpites_iso": "",
+    "fim_palpites_iso": "",
+    "descricao_premio": "",
+    "regras": "",
+}
 
 
 def _empty_state() -> dict[str, Any]:
-    return {"jogadores": [], "palpites": [], "inicio_palpites_iso": "", "fim_palpites_iso": ""}
+    return {
+        "jogadores": [],
+        "palpites": [],
+        "inicio_palpites_iso": "",
+        "fim_palpites_iso": "",
+        "descricao_premio": "",
+        "regras": "",
+    }
 
 
 def _normalize_state(loaded: Any) -> dict[str, Any]:
@@ -40,6 +56,8 @@ def _normalize_state(loaded: Any) -> dict[str, Any]:
         "palpites": [item for item in predictions if isinstance(item, dict)] if isinstance(predictions, list) else [],
         "inicio_palpites_iso": str(loaded.get("inicio_palpites_iso", "")).strip(),
         "fim_palpites_iso": str(loaded.get("fim_palpites_iso", "")).strip(),
+        "descricao_premio": str(loaded.get("descricao_premio", "")).strip(),
+        "regras": str(loaded.get("regras", "")).strip(),
     }
 
 
@@ -205,6 +223,12 @@ def _clean_text(value: object, maximum: int = 80) -> str:
     return " ".join(str(value or "").strip().split())[:maximum]
 
 
+def _clean_multiline_text(value: object, maximum: int = 700) -> str:
+    text = str(value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    lines = [" ".join(line.strip().split()) for line in text.split("\n")]
+    return "\n".join(line for line in lines if line)[:maximum]
+
+
 def _clean_image_url(value: object) -> tuple[str, str]:
     image_url = str(value or "").strip()
     if not image_url:
@@ -268,6 +292,8 @@ def _normalize_period_payload(payload: dict[str, Any]) -> tuple[dict[str, str] |
     return {
         "inicio_palpites_iso": start.isoformat(),
         "fim_palpites_iso": end.isoformat(),
+        "descricao_premio": _clean_multiline_text(payload.get("descricao_premio"), 500),
+        "regras": _clean_multiline_text(payload.get("regras"), 900),
     }, ""
 
 
@@ -379,6 +405,8 @@ def _public_state(state: dict[str, Any], user_id: str, developer: bool) -> dict[
         "jogadores": [_public_player(player, counts, revealed) for player in players if isinstance(player, dict)],
         "inicio_palpites_iso": str(state.get("inicio_palpites_iso", "")),
         "fim_palpites_iso": str(state.get("fim_palpites_iso", "")),
+        "descricao_premio": str(state.get("descricao_premio", "")),
+        "regras": str(state.get("regras", "")),
         "status_palpites": status,
         "palpite_aberto": status == "aberto",
         "escolhas_reveladas": revealed,
@@ -386,6 +414,80 @@ def _public_state(state: dict[str, Any], user_id: str, developer: bool) -> dict[
         "ja_enviou_palpite": isinstance(own_prediction, dict),
         "total_palpites": len(public_predictions) if revealed else 0,
         "palpites_enviados": public_predictions if revealed else [],
+    }
+
+
+def _send_first_goal_choice_email(prediction: dict[str, Any]) -> dict[str, Any]:
+    user_id = str(prediction.get("usuario_id", "")).strip()
+    if not user_id:
+        return {"sent": False, "reason": "Palpite sem usuario vinculado."}
+
+    try:
+        from app import get_smtp_settings, mask_email_for_log, read_employees, send_email_with_fallback
+    except Exception as exc:
+        return {"sent": False, "reason": f"Envio de email indisponivel: {exc}"}
+
+    employees = read_employees()
+    employee = next(
+        (
+            item for item in employees
+            if isinstance(item, dict) and str(item.get("id", "")).strip() == user_id
+        ),
+        {},
+    )
+    recipient_name = str(employee.get("nome", "") or prediction.get("usuario_nome", "")).strip() or "colaborador"
+    recipient_email = str(employee.get("email", "")).strip().lower()
+    if not recipient_email:
+        return {"sent": False, "reason": "Colaborador sem email cadastrado."}
+
+    smtp = get_smtp_settings()
+    from_email = str(smtp.get("from_email", "")).strip()
+    if not from_email:
+        return {"sent": False, "reason": "Email remetente nao configurado."}
+
+    player_name = str(prediction.get("jogador_nome", "")).strip() or "jogador selecionado"
+    sent_at = str(prediction.get("enviado_em_iso", "")).strip()
+
+    message = EmailMessage()
+    from_name = str(smtp.get("from_name", "") or "SuperPop").strip()
+    message["Subject"] = "Seu palpite do primeiro gol foi registrado"
+    message["From"] = f"{from_name} <{from_email}>" if from_name else from_email
+    message["To"] = recipient_email
+
+    text_lines = [
+        f"Ola, {recipient_name}.",
+        "",
+        "Seu palpite para quem fara o primeiro gol do Brasil foi registrado com sucesso.",
+        f"Jogador escolhido: {player_name}",
+    ]
+    if sent_at:
+        text_lines.append(f"Enviado em: {sent_at}")
+    text_lines.extend(["", "Boa sorte!", "Equipe SuperPop"])
+    text_content = "\n".join(text_lines)
+
+    html_parts = [
+        "<!DOCTYPE html><html><body style=\"font-family:Arial,sans-serif;color:#0f172a;line-height:1.5\">",
+        f"<p>Ola, <strong>{escape(recipient_name)}</strong>.</p>",
+        "<p>Seu palpite para quem fara o primeiro gol do Brasil foi registrado com sucesso.</p>",
+        "<div style=\"padding:14px 16px;border:1px solid #e2e8f0;border-radius:12px;background:#f8fafc\">",
+        f"<p style=\"margin:0\"><strong>Jogador escolhido:</strong> {escape(player_name)}</p>",
+    ]
+    if sent_at:
+        html_parts.append(f"<p style=\"margin:8px 0 0\"><strong>Enviado em:</strong> {escape(sent_at)}</p>")
+    html_parts.extend([
+        "</div>",
+        "<p>Boa sorte!<br>Equipe SuperPop</p>",
+        "</body></html>",
+    ])
+    html_content = "".join(html_parts)
+
+    message.set_content(text_content)
+    message.add_alternative(html_content, subtype="html")
+    sent, status = send_email_with_fallback(message, html_content, text_content)
+    return {
+        "sent": sent,
+        "status": status,
+        "to": mask_email_for_log(recipient_email),
     }
 
 
@@ -495,13 +597,6 @@ def delete_player(player_id: str):
 
     with DATA_LOCK:
         state = _read_state()
-        prediction_status = _prediction_status(state)
-        if prediction_status == "nao_configurado":
-            return jsonify({"ok": False, "error": "O periodo para escolhas ainda nao foi configurado."}), 409
-        if prediction_status == "aguardando":
-            return jsonify({"ok": False, "error": "O periodo para escolhas ainda nao iniciou."}), 409
-        if prediction_status == "encerrado":
-            return jsonify({"ok": False, "error": "O periodo para escolhas ja foi encerrado."}), 409
         players = state.get("jogadores")
         predictions = state.get("palpites")
         if not isinstance(players, list):
@@ -541,6 +636,13 @@ def save_first_goal_prediction():
 
     with DATA_LOCK:
         state = _read_state()
+        prediction_status = _prediction_status(state)
+        if prediction_status == "nao_configurado":
+            return jsonify({"ok": False, "error": "O periodo para escolhas ainda nao foi configurado."}), 409
+        if prediction_status == "aguardando":
+            return jsonify({"ok": False, "error": "O periodo para escolhas ainda nao iniciou."}), 409
+        if prediction_status == "encerrado":
+            return jsonify({"ok": False, "error": "O periodo para escolhas ja foi encerrado."}), 409
         players = state.get("jogadores")
         predictions = state.get("palpites")
         if not isinstance(players, list):
@@ -568,7 +670,14 @@ def save_first_goal_prediction():
         state["palpites"] = predictions
         github_sync = _write_state(state)
 
-    return jsonify({"ok": True, "palpite": prediction, "github_sync": github_sync}), 201
+    choice_email = _send_first_goal_choice_email(prediction)
+
+    return jsonify({
+        "ok": True,
+        "palpite": prediction,
+        "github_sync": github_sync,
+        "choice_email": choice_email,
+    }), 201
 
 
 @primeiro_gol_bp.delete("/api/primeiro-gol/palpites/<prediction_id>")
