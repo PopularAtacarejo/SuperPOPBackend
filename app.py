@@ -4619,6 +4619,8 @@ from aniversariantes import birthday_bp
 app.register_blueprint(birthday_bp)
 from dinamicas_pop import dinamicas_pop_bp
 app.register_blueprint(dinamicas_pop_bp)
+from primeiro_gol import primeiro_gol_bp
+app.register_blueprint(primeiro_gol_bp)
 from permissoes_paginas import page_permissions_bp
 app.register_blueprint(page_permissions_bp)
 
