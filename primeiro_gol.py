@@ -58,6 +58,8 @@ def _normalize_state(loaded: Any) -> dict[str, Any]:
         "fim_palpites_iso": str(loaded.get("fim_palpites_iso", "")).strip(),
         "descricao_premio": str(loaded.get("descricao_premio", "")).strip(),
         "regras": str(loaded.get("regras", "")).strip(),
+        "palpite_ganhador_id": str(loaded.get("palpite_ganhador_id", "")).strip(),
+        "palpite_ganhador_selecionado_em_iso": str(loaded.get("palpite_ganhador_selecionado_em_iso", "")).strip(),
     }
 
 
@@ -343,6 +345,7 @@ def _public_prediction(
     prediction: dict[str, Any],
     players_map: dict[str, dict[str, Any]],
     employees_map: dict[str, dict[str, Any]],
+    ganhador_id: str = "",
 ) -> dict[str, Any]:
     user_id = str(prediction.get("usuario_id", "")).strip()
     player_id = str(prediction.get("jogador_id", "")).strip()
@@ -358,6 +361,7 @@ def _public_prediction(
         "jogador_nome": str(player.get("nome", "") or prediction.get("jogador_nome", "")),
         "jogador_foto": str(player.get("foto_url", "") or prediction.get("jogador_foto", "")),
         "enviado_em_iso": str(prediction.get("enviado_em_iso", "")),
+        "ganhador_selecionado": bool(ganhador_id) and ganhador_id == str(prediction.get("id", "")).strip(),
     }
 
 
@@ -390,14 +394,25 @@ def _public_state(state: dict[str, Any], user_id: str, developer: bool) -> dict[
         ),
         None,
     )
-    public_predictions = [
-        _public_prediction(prediction, player_map, employees_map)
-        for prediction in predictions
-        if isinstance(prediction, dict)
-    ]
-    public_predictions.sort(key=lambda item: str(item.get("enviado_em_iso", "")), reverse=True)
+    ganhador_id = str(state.get("palpite_ganhador_id", "")).strip()
     status = _prediction_status(state)
     revealed = developer or status == "encerrado"
+    
+    public_predictions = []
+    for prediction in predictions:
+        if isinstance(prediction, dict):
+            is_own = str(prediction.get("usuario_id", "")).strip() == user_id
+            pub_pred = _public_prediction(prediction, player_map, employees_map, ganhador_id)
+            if not revealed and not is_own:
+                pub_pred["jogador_nome"] = "???"
+                pub_pred["jogador_foto"] = ""
+                pub_pred["jogador_id"] = ""
+                pub_pred["oculto"] = True
+            else:
+                pub_pred["oculto"] = False
+            public_predictions.append(pub_pred)
+
+    public_predictions.sort(key=lambda item: str(item.get("enviado_em_iso", "")), reverse=True)
     counts = _vote_counts(predictions) if revealed else {}
     return {
         "ok": True,
@@ -410,10 +425,10 @@ def _public_state(state: dict[str, Any], user_id: str, developer: bool) -> dict[
         "status_palpites": status,
         "palpite_aberto": status == "aberto",
         "escolhas_reveladas": revealed,
-        "meu_palpite": _public_prediction(own_prediction, player_map, employees_map) if isinstance(own_prediction, dict) else None,
+        "meu_palpite": _public_prediction(own_prediction, player_map, employees_map, ganhador_id) if isinstance(own_prediction, dict) else None,
         "ja_enviou_palpite": isinstance(own_prediction, dict),
-        "total_palpites": len(public_predictions) if revealed else 0,
-        "palpites_enviados": public_predictions if revealed else [],
+        "total_palpites": len(public_predictions),
+        "palpites_enviados": public_predictions,
     }
 
 
@@ -698,6 +713,34 @@ def delete_first_goal_prediction(prediction_id: str):
             return jsonify({"ok": False, "error": "Palpite nao encontrado."}), 404
         predictions.pop(index)
         state["palpites"] = predictions
+        github_sync = _write_state(state)
+
+    return jsonify({"ok": True, "github_sync": github_sync})
+
+@primeiro_gol_bp.put("/api/primeiro-gol/ganhador/<prediction_id>")
+def select_first_goal_winner(prediction_id: str):
+    context = _auth_context()
+    if not context:
+        return jsonify({"ok": False, "error": "Nao autenticado."}), 401
+    if not _is_developer(context):
+        return jsonify({"ok": False, "error": "Apenas desenvolvedores podem selecionar o ganhador."}), 403
+
+    with DATA_LOCK:
+        state = _read_state()
+        predictions = state.get("palpites")
+        if not isinstance(predictions, list):
+            predictions = []
+        index, prediction = _find_prediction(predictions, prediction_id)
+        
+        if prediction_id and not prediction:
+            return jsonify({"ok": False, "error": "Palpite nao encontrado."}), 404
+
+        if not prediction_id and not prediction:
+             state["palpite_ganhador_id"] = ""
+        else:
+             state["palpite_ganhador_id"] = str(prediction.get("id", "")).strip()
+             state["palpite_ganhador_selecionado_em_iso"] = _now_iso()
+
         github_sync = _write_state(state)
 
     return jsonify({"ok": True, "github_sync": github_sync})
